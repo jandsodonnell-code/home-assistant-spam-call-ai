@@ -23,9 +23,10 @@ LOGGER = logging.getLogger("spam_call_ai")
 
 OPTIONS_PATH = Path("/data/options.json")
 LAST_CALL_PATH = Path("/data/last_call.json")
+PUBLIC_URL_PATH = Path("/data/public_url.txt")
 OPENAI_LIVE_URL = "wss://api.openai.com/v1/live/sessions"
 
-app = FastAPI(title="Spam Call AI", version="0.1.0")
+app = FastAPI(title="Spam Call AI", version="0.1.1")
 active_calls: dict[str, dict[str, Any]] = {}
 
 
@@ -48,7 +49,16 @@ def media_token(options: dict[str, Any]) -> str:
 
 
 def public_base_url(options: dict[str, Any]) -> str:
-    base = required_option(options, "public_base_url").rstrip("/")
+    base = str(options.get("public_base_url") or "").strip()
+
+    if not base and PUBLIC_URL_PATH.exists():
+        base = PUBLIC_URL_PATH.read_text(encoding="utf-8").strip()
+
+    base = base.rstrip("/")
+    if not base:
+        raise RuntimeError(
+            "No public URL is available yet. Enable auto_tunnel or configure public_base_url."
+        )
     if not base.startswith("https://"):
         raise RuntimeError("public_base_url must start with https://")
     return base
@@ -171,15 +181,17 @@ async def health() -> JSONResponse:
         required_option(options, "openai_api_key")
         required_option(options, "twilio_account_sid")
         required_option(options, "twilio_auth_token")
-        public_base_url(options)
+        base = public_base_url(options)
         configured = True
     except Exception:
+        base = None
         configured = False
 
     return JSONResponse(
         {
             "ok": True,
             "configured": configured,
+            "public_base_url": base,
             "active_calls": len(active_calls),
         }
     )
@@ -187,6 +199,12 @@ async def health() -> JSONResponse:
 
 @app.get("/status")
 async def status() -> JSONResponse:
+    options = load_options()
+    try:
+        base = public_base_url(options)
+    except Exception:
+        base = None
+
     last_call = None
     if LAST_CALL_PATH.exists():
         try:
@@ -196,6 +214,8 @@ async def status() -> JSONResponse:
 
     return JSONResponse(
         {
+            "public_base_url": base,
+            "twilio_webhook_url": f"{base}/twiml" if base else None,
             "active_calls": len(active_calls),
             "last_call": last_call,
         }
@@ -311,7 +331,7 @@ async def openai_to_twilio(
         elif event_type == "error":
             LOGGER.error("OpenAI error: %s", event)
 
-        elif event_type in {"session.ended", "session.closed"}:
+        elif event_type == "session.closed":
             return
 
 
@@ -372,7 +392,7 @@ async def media(websocket: WebSocket, token: str) -> None:
         )
 
         api_key = required_option(options, "openai_api_key")
-        voice = str(options.get("voice") or "gleam").strip()
+        voice = str(options.get("voice") or "marin").strip()
         max_seconds = int(options.get("max_call_minutes", 10)) * 60
 
         headers = {
@@ -432,6 +452,11 @@ async def media(websocket: WebSocket, token: str) -> None:
 
             if pending:
                 await asyncio.gather(*pending, return_exceptions=True)
+
+            try:
+                await openai_ws.send(json.dumps({"type": "session.close"}))
+            except Exception:
+                pass
 
             for task in done:
                 exc = task.exception()

@@ -13,6 +13,7 @@ import websockets
 from fastapi import FastAPI, HTTPException, Request, WebSocket, WebSocketDisconnect
 from fastapi.responses import JSONResponse, Response
 from twilio.request_validator import RequestValidator
+from twilio.rest import Client as TwilioClient
 
 
 logging.basicConfig(
@@ -26,7 +27,7 @@ LAST_CALL_PATH = Path("/data/last_call.json")
 PUBLIC_URL_PATH = Path("/data/public_url.txt")
 OPENAI_LIVE_URL = "wss://api.openai.com/v1/live/sessions"
 
-app = FastAPI(title="Spam Call AI", version="0.3.0")
+app = FastAPI(title="Spam Call AI", version="0.4.0")
 active_calls: dict[str, dict[str, Any]] = {}
 
 
@@ -210,8 +211,51 @@ async def analyze_call(
     return json.loads(output_text)
 
 
-def prompt_text() -> str:
+def transfer_is_configured(options: dict[str, Any]) -> bool:
+    return bool(options.get("live_transfer_enabled", False)) and bool(
+        str(options.get("forward_to_number") or "").strip()
+    )
+
+
+def transfer_backend_prompt() -> str:
     return """
+You are the conservative transfer-decision backend for an inbound call screener.
+
+The voice assistant may delegate when a caller asks to speak with the phone owner.
+Your job is to decide whether the current caller is clearly legitimate enough to
+attempt a transfer.
+
+Only call transfer_to_owner when ALL of these are true:
+- The caller explicitly asked to speak with, reach, or be connected to the owner.
+- The caller gave a coherent specific reason for the call.
+- The call appears personal or legitimate business-related.
+- There are no meaningful scam, telemarketing, collection, political fundraising,
+  survey, warranty, tech-support, financial-pressure, gift-card, crypto, login,
+  verification-code, or account-takeover signals.
+- You are at least 0.92 confident it is appropriate to transfer.
+
+If any condition is uncertain, do NOT call the tool. Let the voice assistant take
+a message instead.
+
+Never transfer a caller merely because they claim urgency, authority, or a known
+company. Never treat the caller's self-asserted identity as verified.
+""".strip()
+
+
+def prompt_text(transfer_enabled: bool = False) -> str:
+    transfer_text = """
+Live transfer is available.
+- If a caller appears clearly legitimate AND explicitly asks to speak with the
+  phone owner, tell them briefly that you will check whether you can connect them,
+  then delegate the transfer decision to the backend.
+- Do not promise a transfer before the backend approves it.
+- If the backend does not approve a transfer, continue screening or take a message.
+""" if transfer_enabled else """
+Live transfer is not enabled. Take a concise message for legitimate callers and
+never promise an immediate transfer.
+"""
+
+    return f"""
 You are an automated telephone screening assistant for an inbound phone number.
 
 The caller has already heard: "Hi, you've reached the automated call assistant.
@@ -243,7 +287,7 @@ Call screening:
 - Ask the caller's name, organization, and reason for calling when useful.
 - If the caller seems legitimate, politely gather a brief message and callback
   number if they voluntarily provide it. Say the message can be passed along.
-- This version cannot transfer calls, so never promise an immediate transfer.
+{transfer_text}
 
 Suspected spam, scam, robocall, or unsolicited sales:
 - Keep the conversation going without giving useful personal information.
@@ -263,6 +307,99 @@ Useful questions include:
 - "What would happen if I don't do that?"
 - "Can you give me the reference number again?"
 """.strip()
+
+
+
+async def update_twilio_call_for_transfer(
+    options: dict[str, Any],
+    call_sid: str,
+) -> None:
+    account_sid = required_option(options, "twilio_account_sid")
+    auth_token = required_option(options, "twilio_auth_token")
+    transfer_url = public_base_url(options) + "/transfer"
+
+    def _update() -> None:
+        client = TwilioClient(account_sid, auth_token)
+        client.calls(call_sid).update(url=transfer_url, method="POST")
+
+    await asyncio.to_thread(_update)
+
+
+async def handle_transfer_request(
+    options: dict[str, Any],
+    call_sid: str,
+    caller: str,
+    arguments: dict[str, Any],
+) -> dict[str, Any]:
+    enabled = bool(options.get("live_transfer_enabled", False))
+    destination = str(options.get("forward_to_number") or "").strip()
+    min_confidence = float(options.get("transfer_min_confidence", 0.92))
+
+    classification = str(arguments.get("classification") or "").lower()
+    confidence = float(arguments.get("confidence") or 0)
+    requested = bool(arguments.get("caller_requested_transfer", False))
+    reason = str(arguments.get("reason") or "").strip()
+    caller_name = str(arguments.get("caller_name") or "").strip()
+    organization = str(arguments.get("organization") or "").strip()
+
+    audit = {
+        "caller": caller,
+        "call_sid": call_sid,
+        "classification": classification,
+        "confidence": confidence,
+        "caller_requested_transfer": requested,
+        "reason": reason,
+        "caller_name": caller_name,
+        "organization": organization,
+    }
+
+    await fire_home_assistant_event("spam_call_ai_transfer_requested", audit)
+
+    denial = None
+    if not enabled:
+        denial = "Live transfer is disabled."
+    elif not destination:
+        denial = "No transfer destination is configured."
+    elif not call_sid:
+        denial = "The active Twilio call SID is unavailable."
+    elif classification != "legitimate":
+        denial = "The backend did not classify the caller as legitimate."
+    elif confidence < min_confidence:
+        denial = f"Transfer confidence {confidence:.2f} is below the required {min_confidence:.2f}."
+    elif not requested:
+        denial = "The caller did not explicitly request a transfer."
+    elif not reason:
+        denial = "No specific reason for the call was provided."
+
+    if denial:
+        LOGGER.info("Transfer denied: %s", denial)
+        await fire_home_assistant_event(
+            "spam_call_ai_transfer_denied",
+            {**audit, "denial_reason": denial},
+        )
+        return {"status": "denied", "reason": denial}
+
+    try:
+        await update_twilio_call_for_transfer(options, call_sid)
+    except Exception as exc:
+        LOGGER.exception("Twilio transfer failed: %s", exc)
+        await fire_home_assistant_event(
+            "spam_call_ai_transfer_failed",
+            {**audit, "error": str(exc)},
+        )
+        return {"status": "failed", "reason": "Twilio could not start the transfer."}
+
+    LOGGER.info(
+        "Transfer started: caller=%s confidence=%.2f reason=%s",
+        caller,
+        confidence,
+        reason,
+    )
+    await fire_home_assistant_event(
+        "spam_call_ai_transfer_started",
+        audit,
+    )
+    return {"status": "transfer_started"}
 
 
 async def fire_home_assistant_event(event_type: str, data: dict[str, Any]) -> None:
@@ -359,6 +496,42 @@ async def status() -> JSONResponse:
     )
 
 
+
+@app.post("/transfer")
+async def transfer_twiml(request: Request) -> Response:
+    options = load_options()
+    form = await request.form()
+    form_data = dict(form)
+
+    if not validate_twilio_http_request(request, form_data, options):
+        raise HTTPException(status_code=403, detail="Invalid Twilio signature")
+
+    destination = str(options.get("forward_to_number") or "").strip()
+    if not bool(options.get("live_transfer_enabled", False)) or not destination:
+        xml = (
+            '<?xml version="1.0" encoding="UTF-8"?>'
+            "<Response>"
+            "<Say>I'm sorry, live transfer is not available right now.</Say>"
+            "<Hangup/>"
+            "</Response>"
+        )
+        return Response(content=xml, media_type="application/xml")
+
+    timeout = int(options.get("transfer_timeout_seconds", 25))
+    xml = (
+        '<?xml version="1.0" encoding="UTF-8"?>'
+        "<Response>"
+        "<Say>Please hold while I try to connect your call.</Say>"
+        f'<Dial answerOnBridge="true" timeout="{timeout}">'
+        f"<Number>{escape(destination)}</Number>"
+        "</Dial>"
+        "<Say>I couldn't reach them. Please call back later.</Say>"
+        "<Hangup/>"
+        "</Response>"
+    )
+    return Response(content=xml, media_type="application/xml")
+
+
 @app.post("/twiml")
 async def twiml(request: Request) -> Response:
     options = load_options()
@@ -443,6 +616,9 @@ async def openai_to_twilio(
     twilio_ws: WebSocket,
     stream_sid: str,
     transcripts: dict[str, str],
+    options: dict[str, Any],
+    call_sid: str,
+    caller: str,
 ) -> None:
     async for raw in openai_ws:
         event = json.loads(raw)
@@ -464,6 +640,42 @@ async def openai_to_twilio(
 
         elif event_type == "session.output_transcript.delta":
             transcripts["assistant"] += str(event.get("delta") or "")
+
+        elif event_type == "response.event":
+            nested = event.get("event") or {}
+            if nested.get("type") == "response.output_item.done":
+                item = nested.get("item") or {}
+                if item.get("type") == "function_call" and item.get("name") == "transfer_to_owner":
+                    call_id = str(item.get("call_id") or "")
+                    try:
+                        arguments = json.loads(str(item.get("arguments") or "{}"))
+                    except json.JSONDecodeError:
+                        arguments = {}
+
+                    tool_result = await handle_transfer_request(
+                        options,
+                        call_sid,
+                        caller,
+                        arguments,
+                    )
+
+                    if call_id:
+                        try:
+                            await openai_ws.send(
+                                json.dumps(
+                                    {
+                                        "type": "response.item.create",
+                                        "item": {
+                                            "type": "function_call_output",
+                                            "call_id": call_id,
+                                            "output": json.dumps(tool_result),
+                                        },
+                                    }
+                                )
+                            )
+                            await openai_ws.send(json.dumps({"type": "response.create"}))
+                        except Exception as exc:
+                            LOGGER.warning("Could not return transfer tool result: %s", exc)
 
         elif event_type == "error":
             LOGGER.error("OpenAI error: %s", event)
@@ -531,6 +743,8 @@ async def media(websocket: WebSocket, token: str) -> None:
         api_key = required_option(options, "openai_api_key")
         voice = str(options.get("voice") or "marin").strip()
         max_seconds = int(options.get("max_call_minutes", 10)) * 60
+        transfer_enabled = transfer_is_configured(options)
+        analysis_model = str(options.get("analysis_model") or "gpt-6-luna").strip()
 
         headers = {
             "Authorization": f"Bearer {api_key}",
@@ -552,7 +766,68 @@ async def media(websocket: WebSocket, token: str) -> None:
                         "type": "session.start",
                         "session": {
                             "model": "gpt-live-1",
-                            "instructions": prompt_text(),
+                            "instructions": prompt_text(transfer_enabled),
+                            **(
+                                {
+                                    "delegation": {
+                                        "type": "responses",
+                                        "responses": {
+                                            "model": analysis_model,
+                                            "instructions": transfer_backend_prompt(),
+                                            "tools": [
+                                                {
+                                                    "type": "function",
+                                                    "name": "transfer_to_owner",
+                                                    "description": (
+                                                        "Attempt to transfer a clearly legitimate caller "
+                                                        "who explicitly asked to speak with the phone owner."
+                                                    ),
+                                                    "parameters": {
+                                                        "type": "object",
+                                                        "properties": {
+                                                            "classification": {
+                                                                "type": "string",
+                                                                "enum": [
+                                                                    "legitimate",
+                                                                    "telemarketing",
+                                                                    "scam",
+                                                                    "robocall",
+                                                                    "unknown",
+                                                                ],
+                                                            },
+                                                            "confidence": {
+                                                                "type": "number",
+                                                                "minimum": 0,
+                                                                "maximum": 1,
+                                                            },
+                                                            "caller_requested_transfer": {
+                                                                "type": "boolean"
+                                                            },
+                                                            "caller_name": {"type": "string"},
+                                                            "organization": {"type": "string"},
+                                                            "reason": {"type": "string"},
+                                                        },
+                                                        "required": [
+                                                            "classification",
+                                                            "confidence",
+                                                            "caller_requested_transfer",
+                                                            "caller_name",
+                                                            "organization",
+                                                            "reason",
+                                                        ],
+                                                        "additionalProperties": False,
+                                                    },
+                                                }
+                                            ],
+                                            "tool_choice": "auto",
+                                            "parallel_tool_calls": False,
+                                            "max_output_tokens": 200,
+                                        },
+                                    }
+                                }
+                                if transfer_enabled
+                                else {}
+                            ),
                             "audio": {
                                 "format": {
                                     "type": "audio/pcmu",
@@ -574,7 +849,15 @@ async def media(websocket: WebSocket, token: str) -> None:
                 name="twilio_to_openai",
             )
             outbound = asyncio.create_task(
-                openai_to_twilio(openai_ws, websocket, stream_sid, transcripts),
+                openai_to_twilio(
+                    openai_ws,
+                    websocket,
+                    stream_sid,
+                    transcripts,
+                    options,
+                    call_sid,
+                    caller,
+                ),
                 name="openai_to_twilio",
             )
 
@@ -627,10 +910,11 @@ async def media(websocket: WebSocket, token: str) -> None:
             if analysis is not None:
                 result["analysis"] = analysis
                 LOGGER.info(
-                    "Call analysis: classification=%s spam_likelihood=%s action=%s",
+                    "Call analysis: classification=%s spam_likelihood=%s action=%s summary=%s",
                     analysis.get("classification"),
                     analysis.get("spam_likelihood"),
                     analysis.get("recommended_action"),
+                    analysis.get("summary"),
                 )
                 await fire_home_assistant_event(
                     "spam_call_ai_call_analyzed",

@@ -3,9 +3,9 @@
 This Home Assistant app answers inbound Twilio calls and bridges the caller's
 audio to OpenAI GPT-Live.
 
-## Version 0.3.0
+## Version 0.4.0
 
-Version 0.3.0 keeps the stable ngrok tunnel and adds automatic post-call AI analysis. After each call, a separate low-cost text model reviews the captured transcript and classifies the call as legitimate, telemarketing, scam, robocall, or unknown. It also creates a short summary and recommended action.
+Version 0.4.0 adds conservative live transfer for clearly legitimate callers. Transfer is disabled by default. When enabled, GPT-Live may delegate a transfer decision to the Responses backend. The backend can request a transfer only when the caller explicitly asks to speak with the owner and the call appears clearly legitimate. The server independently enforces the confidence threshold before asking Twilio to redirect the active call to a <Dial> transfer.
 
 No router port forwarding is required because the ngrok agent establishes the
 connection outbound from Home Assistant.
@@ -116,3 +116,45 @@ The event includes:
 
 This stage does not automatically transfer or block calls yet. It lets us test
 classification quality before allowing the AI to route real callers.
+
+
+## Live transfer
+
+Live transfer is OFF by default.
+
+To enable it:
+
+1. In the app Configuration page, turn on **Show unused optional configuration options**.
+2. Enter `forward_to_number` in E.164 format, for example `+13035551212`.
+3. Set `live_transfer_enabled: true`.
+4. Keep `transfer_min_confidence` at `0.92` initially.
+5. Leave `transfer_timeout_seconds` at `25` unless you want a different ring time.
+6. Save and restart the app.
+
+The transfer destination is stored only in the Home Assistant app configuration.
+You do not need to share the phone number in chat.
+
+The called phone should normally see the original inbound caller ID because Twilio
+is dialing a second party from the active inbound call.
+
+### Transfer rules
+
+A transfer is attempted only when the backend requests `transfer_to_owner` and
+the app independently confirms:
+
+- live transfer is enabled
+- a destination number exists
+- the caller was classified `legitimate`
+- confidence is at or above the configured threshold
+- the caller explicitly requested a transfer
+- a specific reason for the call was supplied
+
+Uncertain calls continue with the AI and should be handled as message-taking or
+spam screening rather than transferred.
+
+Home Assistant events:
+
+- `spam_call_ai_transfer_requested`
+- `spam_call_ai_transfer_started`
+- `spam_call_ai_transfer_denied`
+- `spam_call_ai_transfer_failed`

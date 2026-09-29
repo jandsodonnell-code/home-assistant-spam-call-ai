@@ -1,5 +1,5 @@
 name: "Spam Call AI"
-version: "0.5.0"
+version: "0.6.0"
 slug: "spam_call_ai"
 description: "AI voice screening for inbound Twilio calls using OpenAI GPT-Live"
 url: "https://github.com/jandsodonnell-code/home-assistant-spam-call-ai"
@@ -30,6 +30,12 @@ options:
   trusted_rering_enabled: true
   trusted_callers: ""
   trusted_rering_timeout_seconds: 15
+  google_contacts_enabled: false
+  google_oauth_client_id: null
+  google_oauth_client_secret: null
+  google_setup_key: null
+  google_contact_label: "Trusted Callers"
+  google_contacts_sync_minutes: 15
   transfer_min_confidence: 0.92
   transfer_timeout_seconds: 25
   voice: "marin"
@@ -50,6 +56,12 @@ schema:
   trusted_rering_enabled: bool
   trusted_callers: str
   trusted_rering_timeout_seconds: "int(5,30)"
+  google_contacts_enabled: bool
+  google_oauth_client_id: "str?"
+  google_oauth_client_secret: "password?"
+  google_setup_key: "password?"
+  google_contact_label: str
+  google_contacts_sync_minutes: "int(5,1440)"
   forward_to_number: "str?"
   transfer_min_confidence: "float(0.5,1.0)"
   transfer_timeout_seconds: "int(10,60)"

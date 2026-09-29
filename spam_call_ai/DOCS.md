@@ -3,9 +3,9 @@
 This Home Assistant app answers inbound Twilio calls and bridges the caller's
 audio to OpenAI GPT-Live.
 
-## Version 0.4.0
+## Version 0.4.1
 
-Version 0.4.0 adds conservative live transfer for clearly legitimate callers. Transfer is disabled by default. When enabled, GPT-Live may delegate a transfer decision to the Responses backend. The backend can request a transfer only when the caller explicitly asks to speak with the owner and the call appears clearly legitimate. The server independently enforces the confidence threshold before asking Twilio to redirect the active call to a <Dial> transfer.
+Version 0.4.1 makes the live-transfer trigger explicit for callers who ask for any person by name or ask to be connected, and requires the delegated backend to return a transfer-decision tool call so the app can enforce the transfer rules. Transfer is disabled by default. When enabled, GPT-Live may delegate a transfer decision to the Responses backend. The backend can request a transfer only when the caller explicitly asks to speak with the owner and the call appears clearly legitimate. The server independently enforces the confidence threshold before asking Twilio to redirect the active call to a <Dial> transfer.
 
 No router port forwarding is required because the ngrok agent establishes the
 connection outbound from Home Assistant.
@@ -158,3 +158,15 @@ Home Assistant events:
 - `spam_call_ai_transfer_started`
 - `spam_call_ai_transfer_denied`
 - `spam_call_ai_transfer_failed`
+
+
+### Transfer diagnostics
+
+When a caller asks to speak with someone, the log should now show:
+
+- `Live transfer check delegated`
+- `Transfer decision tool requested by backend`
+- then either `Transfer started` or `Transfer denied`
+
+This makes it clear whether the live model delegated the request and whether the
+server accepted the backend decision.

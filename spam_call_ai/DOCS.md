@@ -3,9 +3,9 @@
 This Home Assistant app answers inbound Twilio calls and bridges the caller's
 audio to OpenAI GPT-Live.
 
-## Version 0.4.1
+## Version 0.5.0
 
-Version 0.4.1 makes the live-transfer trigger explicit for callers who ask for any person by name or ask to be connected, and requires the delegated backend to return a transfer-decision tool call so the app can enforce the transfer rules. Transfer is disabled by default. When enabled, GPT-Live may delegate a transfer decision to the Responses backend. The backend can request a transfer only when the caller explicitly asks to speak with the owner and the call appears clearly legitimate. The server independently enforces the confidence threshold before asking Twilio to redirect the active call to a <Dial> transfer.
+Version 0.5.0 adds a trusted-caller re-ring path for conditional cell-phone forwarding. Trusted family numbers can be sent back to the cell for one additional ring attempt; if that attempt is not answered, the original caller falls back to the AI message-taking flow. Transfer is disabled by default. When enabled, GPT-Live may delegate a transfer decision to the Responses backend. The backend can request a transfer only when the caller explicitly asks to speak with the owner and the call appears clearly legitimate. The server independently enforces the confidence threshold before asking Twilio to redirect the active call to a <Dial> transfer.
 
 No router port forwarding is required because the ngrok agent establishes the
 connection outbound from Home Assistant.
@@ -170,3 +170,35 @@ When a caller asks to speak with someone, the log should now show:
 
 This makes it clear whether the live model delegated the request and whether the
 server accepted the backend decision.
+
+
+## Trusted family re-ring
+
+This mode is designed for conditional forwarding from the user's cell to the
+Twilio number.
+
+Configuration:
+
+- `trusted_rering_enabled: true`
+- `trusted_callers`: comma-separated trusted phone numbers
+- `forward_to_number`: the user's cell number
+- `trusted_rering_timeout_seconds: 15`
+
+Enter trusted numbers in Home Assistant only; they do not need to be shared in
+chat. Use E.164 format when possible, for example `+13035551212`.
+
+Flow:
+
+1. The cell rings normally.
+2. If unanswered/rejected/unreachable, the carrier forwards the call to Twilio.
+3. If the incoming caller number is in `trusted_callers`, Twilio rings the
+   user's cell one more time.
+4. The second ring intentionally shows the Twilio number as caller ID. This
+   allows the app to detect a second unanswered call that is forwarded back to
+   Twilio and stop the loop.
+5. If the second ring is not answered, the original trusted caller falls back
+   to the AI, which can take a message.
+6. Non-trusted callers go directly to the AI message-taking/screening flow.
+
+The app emits `spam_call_ai_trusted_caller_rering` when it recognizes a
+trusted caller and starts the second ring.

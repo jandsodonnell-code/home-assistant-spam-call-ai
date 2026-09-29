@@ -1,0 +1,36 @@
+name: "Spam Call AI"
+version: "0.1.0"
+slug: "spam_call_ai"
+description: "AI voice screening for inbound Twilio calls using OpenAI GPT-Live"
+url: "https://github.com/jandsodonnell-code/home-assistant-spam-call-ai"
+startup: application
+boot: auto
+init: false
+stage: experimental
+arch:
+  - amd64
+  - aarch64
+homeassistant_api: true
+ports:
+  8000/tcp: 8000
+ports_description:
+  8000/tcp: "Spam Call AI webhook and WebSocket server"
+watchdog: "http://[HOST]:[PORT:8000]/health"
+options:
+  openai_api_key: null
+  twilio_account_sid: null
+  twilio_auth_token: null
+  public_base_url: null
+  max_call_minutes: 10
+  voice: "gleam"
+  greeting: "Hi, you've reached the automated call assistant. Who's calling, and what are you calling about?"
+  validate_twilio_signature: true
+schema:
+  openai_api_key: password
+  twilio_account_sid: str
+  twilio_auth_token: password
+  public_base_url: url
+  max_call_minutes: "int(1,60)"
+  voice: str
+  greeting: str
+  validate_twilio_signature: bool

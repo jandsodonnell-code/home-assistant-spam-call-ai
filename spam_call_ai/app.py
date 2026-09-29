@@ -27,7 +27,7 @@ LAST_CALL_PATH = Path("/data/last_call.json")
 PUBLIC_URL_PATH = Path("/data/public_url.txt")
 OPENAI_LIVE_URL = "wss://api.openai.com/v1/live/sessions"
 
-app = FastAPI(title="Spam Call AI", version="0.4.0")
+app = FastAPI(title="Spam Call AI", version="0.4.1")
 active_calls: dict[str, dict[str, Any]] = {}
 
 
@@ -226,7 +226,8 @@ Your job is to decide whether the current caller is clearly legitimate enough to
 attempt a transfer.
 
 Only call transfer_to_owner when ALL of these are true:
-- The caller explicitly asked to speak with, reach, or be connected to the owner.
+- The caller explicitly asked to speak with, reach, or be connected to a person
+  at this number, including asking for someone by name.
 - The caller gave a coherent specific reason for the call.
 - The call appears personal or legitimate business-related.
 - There are no meaningful scam, telemarketing, collection, political fundraising,
@@ -245,9 +246,12 @@ company. Never treat the caller's self-asserted identity as verified.
 def prompt_text(transfer_enabled: bool = False) -> str:
     transfer_text = """
 Live transfer is available.
-- If a caller appears clearly legitimate AND explicitly asks to speak with the
-  phone owner, tell them briefly that you will check whether you can connect them,
-  then delegate the transfer decision to the backend.
+- When a caller explicitly asks to speak with, reach, or be connected to a person
+  at this number, including asking for someone by name, you MUST delegate the
+  transfer decision to the backend after you have their name/organization when
+  available and a specific reason for the call.
+- Do not require them to use the words "owner" or "transfer."
+- Tell them briefly that you will check whether you can connect them, then delegate.
 - Do not promise a transfer before the backend approves it.
 - If the backend does not approve a transfer, continue screening or take a message.
 """ if transfer_enabled else """
@@ -641,11 +645,20 @@ async def openai_to_twilio(
         elif event_type == "session.output_transcript.delta":
             transcripts["assistant"] += str(event.get("delta") or "")
 
+        elif event_type == "session.delegation.created":
+            delegation = event.get("delegation") or {}
+            LOGGER.info(
+                "Live transfer check delegated: id=%s target=%s",
+                delegation.get("id"),
+                delegation.get("target"),
+            )
+
         elif event_type == "response.event":
             nested = event.get("event") or {}
             if nested.get("type") == "response.output_item.done":
                 item = nested.get("item") or {}
                 if item.get("type") == "function_call" and item.get("name") == "transfer_to_owner":
+                    LOGGER.info("Transfer decision tool requested by backend")
                     call_id = str(item.get("call_id") or "")
                     try:
                         arguments = json.loads(str(item.get("arguments") or "{}"))
@@ -819,7 +832,7 @@ async def media(websocket: WebSocket, token: str) -> None:
                                                     },
                                                 }
                                             ],
-                                            "tool_choice": "auto",
+                                            "tool_choice": "required",
                                             "parallel_tool_calls": False,
                                             "max_output_tokens": 200,
                                         },

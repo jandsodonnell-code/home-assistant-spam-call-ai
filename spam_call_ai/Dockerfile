@@ -8,7 +8,16 @@ LABEL \
   io.hass.type="app" \
   io.hass.arch="${BUILD_ARCH}"
 
-RUN apk add --no-cache python3 py3-pip
+RUN apk add --no-cache python3 py3-pip curl ca-certificates
+
+RUN case "${BUILD_ARCH}" in \
+      amd64) CF_ARCH="amd64" ;; \
+      aarch64) CF_ARCH="arm64" ;; \
+      *) echo "Unsupported architecture: ${BUILD_ARCH}" && exit 1 ;; \
+    esac \
+  && curl -fsSL "https://github.com/cloudflare/cloudflared/releases/latest/download/cloudflared-linux-${CF_ARCH}" -o /usr/local/bin/cloudflared \
+  && chmod +x /usr/local/bin/cloudflared \
+  && /usr/local/bin/cloudflared --version
 
 WORKDIR /app
 

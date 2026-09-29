@@ -3,9 +3,9 @@
 This Home Assistant app answers inbound Twilio calls and bridges the caller's
 audio to OpenAI GPT-Live.
 
-## Version 0.5.0
+## Version 0.6.0
 
-Version 0.5.0 adds a trusted-caller re-ring path for conditional cell-phone forwarding. Trusted family numbers can be sent back to the cell for one additional ring attempt; if that attempt is not answered, the original caller falls back to the AI message-taking flow. Transfer is disabled by default. When enabled, GPT-Live may delegate a transfer decision to the Responses backend. The backend can request a transfer only when the caller explicitly asks to speak with the owner and the call appears clearly legitimate. The server independently enforces the confidence threshold before asking Twilio to redirect the active call to a <Dial> transfer.
+Version 0.6.0 adds automatic Google Contacts syncing. The app reads only the Google Contacts label configured in `google_contact_label` (default: `Trusted Callers`) using the People API `contacts.readonly` OAuth scope. Those phone numbers are merged with any manually configured trusted callers. Transfer is disabled by default. When enabled, GPT-Live may delegate a transfer decision to the Responses backend. The backend can request a transfer only when the caller explicitly asks to speak with the owner and the call appears clearly legitimate. The server independently enforces the confidence threshold before asking Twilio to redirect the active call to a <Dial> transfer.
 
 No router port forwarding is required because the ngrok agent establishes the
 connection outbound from Home Assistant.
@@ -202,3 +202,74 @@ Flow:
 
 The app emits `spam_call_ai_trusted_caller_rering` when it recognizes a
 trusted caller and starts the second ring.
+
+
+## Google Contacts automatic sync
+
+### Home Assistant configuration
+
+Set:
+
+- `google_contacts_enabled: true`
+- `google_oauth_client_id`: your Google OAuth Web application client ID
+- `google_oauth_client_secret`: your Google OAuth Web application client secret
+- `google_setup_key`: create your own private setup password
+- `google_contact_label: Trusted Callers`
+- `google_contacts_sync_minutes: 15`
+
+The OAuth client secret and setup key stay in Home Assistant app configuration.
+Do not paste them into chat or screenshots.
+
+### Google Cloud setup
+
+1. Create or select a Google Cloud project.
+2. Enable the **Google People API**.
+3. Configure the Google Auth Platform / OAuth consent screen.
+   For a normal personal Gmail account, use an External audience and add the
+   Google account as a test user while the app is in Testing.
+4. Create an OAuth client with application type **Web application**.
+5. Add this exact Authorized redirect URI:
+
+   `https://wand-mold-displace.ngrok-free.dev/google/oauth/callback`
+
+6. Copy the Client ID and Client Secret into the Spam Call AI configuration.
+7. Save and restart Spam Call AI.
+8. Open:
+
+   `https://wand-mold-displace.ngrok-free.dev/google/setup`
+
+9. Enter the private Google setup key and choose **Authorize Google Contacts**.
+10. Sign in to the Google account that owns the trusted contacts and approve the
+    read-only Contacts permission.
+
+The app stores the Google refresh token under the app's private /data directory
+and refreshes the access token automatically.
+
+### Add trusted contacts
+
+Create a Google Contacts label named exactly:
+
+`Trusted Callers`
+
+On the Google Contacts website, select the people you want trusted, click
+**Manage labels**, select **Trusted Callers**, and click **Apply**.
+
+On Android Contacts, create/select the **Trusted Callers** label and add the
+contacts to it.
+
+The app automatically re-syncs the label every 15 minutes by default. The
+Google setup page also includes a **Sync Trusted Callers** button for immediate
+syncing.
+
+Only contacts in that label are treated as Google-synced trusted callers.
+Removing a person from the label removes them from the synced trusted list at
+the next successful sync. Any phone numbers still present in the manual
+`trusted_callers` configuration remain trusted.
+
+### Events
+
+Successful sync fires:
+
+`spam_call_ai_google_contacts_synced`
+
+The event includes the label, contact count, and phone-number count.

@@ -3,11 +3,9 @@
 This Home Assistant app answers inbound Twilio calls and bridges the caller's
 audio to OpenAI GPT-Live.
 
-## Version 0.2.0
+## Version 0.3.0
 
-Version 0.2.0 adds a stable ngrok tunnel option. The app can start ngrok
-automatically and expose its local port 8000 at the assigned ngrok development
-domain.
+Version 0.3.0 keeps the stable ngrok tunnel and adds automatic post-call AI analysis. After each call, a separate low-cost text model reviews the captured transcript and classifies the call as legitimate, telemarketing, scam, robocall, or unknown. It also creates a short summary and recommended action.
 
 No router port forwarding is required because the ngrok agent establishes the
 connection outbound from Home Assistant.
@@ -89,3 +87,32 @@ caller/assistant transcript text.
 - Use a maximum call duration.
 - The voice model is not given Home Assistant control, email access, contacts,
   financial access, or other private tools.
+
+
+## Call analysis
+
+Call analysis is enabled by default:
+
+- `analyze_calls: true`
+- `analysis_model: gpt-6-luna`
+
+After the voice call ends, the app sends the recent transcript to the OpenAI
+Responses API using Structured Outputs. The analysis is saved with the last-call
+record and emitted as the Home Assistant event:
+
+`spam_call_ai_call_analyzed`
+
+The event includes:
+
+- classification
+- spam likelihood from 0 to 1
+- caller name, when stated
+- organization, when stated
+- reason for calling
+- callback number, only when stated
+- brief summary
+- recommended action: allow, block, or review
+- short factual signals used for screening
+
+This stage does not automatically transfer or block calls yet. It lets us test
+classification quality before allowing the AI to route real callers.

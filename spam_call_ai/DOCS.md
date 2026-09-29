@@ -3,15 +3,14 @@
 This Home Assistant app answers inbound Twilio calls and bridges the caller's
 audio to OpenAI GPT-Live.
 
-## Version 0.1.1
+## Version 0.2.0
 
-Version 0.1.1 adds an automatic Cloudflare Quick Tunnel for initial testing.
-This means you do not need to expose Home Assistant itself or configure a
-separate tunnel before your first test.
+Version 0.2.0 adds a stable ngrok tunnel option. The app can start ngrok
+automatically and expose its local port 8000 at the assigned ngrok development
+domain.
 
-Cloudflare Quick Tunnels are intended only for testing. Their public URL changes
-whenever the app or tunnel restarts. After testing, switch to a stable named
-tunnel or another stable HTTPS hostname.
+No router port forwarding is required because the ngrok agent establishes the
+connection outbound from Home Assistant.
 
 ## Required configuration
 
@@ -27,57 +26,42 @@ This begins with `AC`.
 
 Use the Auth Token from the Twilio Console. Keep it private.
 
-## Public access
+### ngrok Authtoken
 
-### Easiest testing setup
+Copy the ngrok authtoken from your ngrok dashboard and paste it into the app
+configuration. Keep it private.
 
-Leave:
+### ngrok Domain
 
-- `auto_tunnel: true`
-- `public_base_url` blank
+For this installation the assigned development domain is:
 
-When the app starts, it will create a free temporary
-`https://....trycloudflare.com` URL and print two lines in the app log:
+`wand-mold-displace.ngrok-free.dev`
 
-- `PUBLIC BASE URL: ...`
-- `TWILIO WEBHOOK: .../twiml`
+The public base URL is therefore:
 
-Use the TWILIO WEBHOOK value in Twilio.
+`https://wand-mold-displace.ngrok-free.dev`
 
-The temporary URL changes if the app restarts, so you must update Twilio after
-a restart during testing.
+and the Twilio webhook is:
 
-### Stable production setup
+`https://wand-mold-displace.ngrok-free.dev/twiml`
 
-Later, set `auto_tunnel: false` and enter a stable HTTPS URL in
-`public_base_url`. A named Cloudflare Tunnel is one option.
+## Tunnel selection
 
-Do not point this app at your normal Home Assistant URL unless you have
-explicitly configured a reverse proxy route for this app.
+The app checks tunnel options in this order:
 
-## Other options
+1. `public_base_url`, when explicitly configured.
+2. ngrok, when both `ngrok_authtoken` and `ngrok_domain` are configured.
+3. Cloudflare Quick Tunnel, only when `auto_tunnel: true`.
 
-### Maximum Call Minutes
-
-Start with 10 minutes to control API usage.
-
-### Voice
-
-The default is `marin`, a GPT-Live built-in voice.
-
-### Greeting
-
-This is spoken by Twilio before the live AI audio stream starts.
+For the stable ngrok setup, keep `auto_tunnel: false`.
 
 ## Twilio webhook
 
-After the app is running:
+Set the Twilio Voice incoming-call webhook to:
 
-- Incoming call method: Webhook
-- Webhook URL: copy the `TWILIO WEBHOOK` line from the app log
-- HTTP method: POST
+`https://wand-mold-displace.ngrok-free.dev/twiml`
 
-The app validates Twilio's HTTP signature by default.
+and use HTTP POST.
 
 ## Home Assistant events
 
@@ -86,7 +70,7 @@ The app fires:
 - `spam_call_ai_call_started`
 - `spam_call_ai_call_ended`
 
-The ended event includes the caller number, call duration, call SID, and recent
+The ended event includes caller number, call duration, call SID, and recent
 caller/assistant transcript text.
 
 ## Useful endpoints
@@ -98,17 +82,10 @@ caller/assistant transcript text.
 
 ## Security notes
 
-- Never paste API keys or Auth Tokens into chat messages or screenshots.
+- Never paste the ngrok authtoken, OpenAI API key, or Twilio Auth Token into
+  chat messages or screenshots.
 - Keep Twilio signature validation enabled except during controlled debugging.
 - Use a dedicated OpenAI project/key and set a project spending limit.
 - Use a maximum call duration.
 - The voice model is not given Home Assistant control, email access, contacts,
   financial access, or other private tools.
-
-## Testing
-
-Call the Twilio number from a verified caller if your Twilio account is still
-on trial.
-
-Try a legitimate-caller scenario and a fake telemarketing scenario. Do not use
-real account numbers, passwords, verification codes, or financial details.

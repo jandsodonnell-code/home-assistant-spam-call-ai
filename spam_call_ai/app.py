@@ -1,18 +1,21 @@
 import asyncio
 import hashlib
+import hmac
 import json
 import logging
 import os
 import re
+import secrets
 import time
 from pathlib import Path
 from typing import Any
 from xml.sax.saxutils import escape, quoteattr
+from urllib.parse import urlencode
 
 import httpx
 import websockets
 from fastapi import FastAPI, HTTPException, Request, WebSocket, WebSocketDisconnect
-from fastapi.responses import JSONResponse, Response
+from fastapi.responses import HTMLResponse, JSONResponse, RedirectResponse, Response
 from twilio.request_validator import RequestValidator
 from twilio.rest import Client as TwilioClient
 
@@ -26,9 +29,13 @@ LOGGER = logging.getLogger("spam_call_ai")
 OPTIONS_PATH = Path("/data/options.json")
 LAST_CALL_PATH = Path("/data/last_call.json")
 PUBLIC_URL_PATH = Path("/data/public_url.txt")
+GOOGLE_TOKEN_PATH = Path("/data/google_oauth.json")
+GOOGLE_STATE_PATH = Path("/data/google_oauth_state.json")
+GOOGLE_CONTACTS_PATH = Path("/data/google_trusted_contacts.json")
+GOOGLE_SCOPE = "https://www.googleapis.com/auth/contacts.readonly"
 OPENAI_LIVE_URL = "wss://api.openai.com/v1/live/sessions"
 
-app = FastAPI(title="Spam Call AI", version="0.5.0")
+app = FastAPI(title="Spam Call AI", version="0.6.0")
 active_calls: dict[str, dict[str, Any]] = {}
 
 
@@ -225,6 +232,274 @@ def normalize_phone_number(value: str) -> str:
     return ""
 
 
+
+def optional_option(options: dict[str, Any], name: str) -> str:
+    value = options.get(name)
+    if value is None:
+        return ""
+    text = str(value).strip()
+    if text.lower() in {"", "null", "none"}:
+        return ""
+    return text
+
+
+def load_json_file(path: Path) -> dict[str, Any]:
+    if not path.exists():
+        return {}
+    try:
+        return json.loads(path.read_text(encoding="utf-8"))
+    except Exception:
+        return {}
+
+
+def save_json_file(path: Path, data: dict[str, Any]) -> None:
+    path.write_text(
+        json.dumps(data, indent=2, ensure_ascii=False),
+        encoding="utf-8",
+    )
+
+
+def google_redirect_uri(options: dict[str, Any]) -> str:
+    return public_base_url(options) + "/google/oauth/callback"
+
+
+def google_contacts_status() -> dict[str, Any]:
+    contacts = load_json_file(GOOGLE_CONTACTS_PATH)
+    token = load_json_file(GOOGLE_TOKEN_PATH)
+    return {
+        "authorized": bool(token.get("refresh_token")),
+        "last_sync_unix": contacts.get("synced_at_unix"),
+        "label": contacts.get("label"),
+        "contact_count": contacts.get("contact_count", 0),
+        "number_count": len(contacts.get("numbers") or []),
+        "last_error": contacts.get("last_error"),
+    }
+
+
+def google_synced_numbers() -> set[str]:
+    data = load_json_file(GOOGLE_CONTACTS_PATH)
+    return {
+        normalize_phone_number(number)
+        for number in (data.get("numbers") or [])
+        if normalize_phone_number(number)
+    }
+
+
+def google_synced_name_for_number(caller: str) -> str:
+    target = normalize_phone_number(caller)
+    if not target:
+        return ""
+    data = load_json_file(GOOGLE_CONTACTS_PATH)
+    for contact in data.get("contacts") or []:
+        for number in contact.get("numbers") or []:
+            if normalize_phone_number(number) == target:
+                return str(contact.get("name") or "").strip()
+    return ""
+
+
+async def get_google_access_token(options: dict[str, Any]) -> str:
+    token_data = load_json_file(GOOGLE_TOKEN_PATH)
+    access_token = str(token_data.get("access_token") or "")
+    expires_at = float(token_data.get("expires_at") or 0)
+
+    if access_token and expires_at > time.time() + 60:
+        return access_token
+
+    refresh_token = str(token_data.get("refresh_token") or "")
+    if not refresh_token:
+        raise RuntimeError("Google Contacts has not been authorized yet.")
+
+    client_id = optional_option(options, "google_oauth_client_id")
+    client_secret = optional_option(options, "google_oauth_client_secret")
+    if not client_id or not client_secret:
+        raise RuntimeError("Google OAuth client ID/secret is not configured.")
+
+    async with httpx.AsyncClient(timeout=30) as client:
+        response = await client.post(
+            "https://oauth2.googleapis.com/token",
+            data={
+                "client_id": client_id,
+                "client_secret": client_secret,
+                "refresh_token": refresh_token,
+                "grant_type": "refresh_token",
+            },
+        )
+        response.raise_for_status()
+        refreshed = response.json()
+
+    token_data["access_token"] = refreshed["access_token"]
+    token_data["expires_at"] = time.time() + int(refreshed.get("expires_in", 3600))
+    if refreshed.get("scope"):
+        token_data["scope"] = refreshed["scope"]
+    save_json_file(GOOGLE_TOKEN_PATH, token_data)
+    return str(token_data["access_token"])
+
+
+async def sync_google_contacts(options: dict[str, Any]) -> dict[str, Any]:
+    if not bool(options.get("google_contacts_enabled", False)):
+        raise RuntimeError("Google Contacts sync is disabled.")
+
+    label = str(options.get("google_contact_label") or "Trusted Callers").strip()
+    if not label:
+        raise RuntimeError("google_contact_label cannot be blank.")
+
+    access_token = await get_google_access_token(options)
+    headers = {"Authorization": f"Bearer {access_token}"}
+
+    groups: list[dict[str, Any]] = []
+    page_token = ""
+    async with httpx.AsyncClient(timeout=45) as client:
+        while True:
+            params = {
+                "pageSize": 1000,
+                "groupFields": "name,groupType,memberCount",
+            }
+            if page_token:
+                params["pageToken"] = page_token
+            response = await client.get(
+                "https://people.googleapis.com/v1/contactGroups",
+                headers=headers,
+                params=params,
+            )
+            response.raise_for_status()
+            payload = response.json()
+            groups.extend(payload.get("contactGroups") or [])
+            page_token = str(payload.get("nextPageToken") or "")
+            if not page_token:
+                break
+
+        group = next(
+            (
+                item
+                for item in groups
+                if str(item.get("name") or "").strip().casefold() == label.casefold()
+            ),
+            None,
+        )
+        if not group:
+            raise RuntimeError(
+                f'Google Contacts label "{label}" was not found. Create that label and try again.'
+            )
+
+        group_resource = str(group.get("resourceName") or "")
+        contacts: list[dict[str, Any]] = []
+        numbers: set[str] = set()
+        page_token = ""
+
+        while True:
+            params = {
+                "pageSize": 1000,
+                "personFields": "names,phoneNumbers,memberships",
+                "sources": "READ_SOURCE_TYPE_CONTACT",
+            }
+            if page_token:
+                params["pageToken"] = page_token
+
+            response = await client.get(
+                "https://people.googleapis.com/v1/people/me/connections",
+                headers=headers,
+                params=params,
+            )
+            response.raise_for_status()
+            payload = response.json()
+
+            for person in payload.get("connections") or []:
+                memberships = person.get("memberships") or []
+                in_group = any(
+                    str(
+                        (membership.get("contactGroupMembership") or {}).get(
+                            "contactGroupResourceName"
+                        )
+                        or ""
+                    )
+                    == group_resource
+                    for membership in memberships
+                )
+                if not in_group:
+                    continue
+
+                names = person.get("names") or []
+                display_name = ""
+                if names:
+                    display_name = str(names[0].get("displayName") or "").strip()
+
+                person_numbers: list[str] = []
+                for phone in person.get("phoneNumbers") or []:
+                    normalized = normalize_phone_number(str(phone.get("value") or ""))
+                    if normalized and normalized not in person_numbers:
+                        person_numbers.append(normalized)
+                        numbers.add(normalized)
+
+                if person_numbers:
+                    contacts.append(
+                        {
+                            "name": display_name,
+                            "numbers": person_numbers,
+                        }
+                    )
+
+            page_token = str(payload.get("nextPageToken") or "")
+            if not page_token:
+                break
+
+    data = {
+        "synced_at_unix": time.time(),
+        "label": label,
+        "group_resource": group_resource,
+        "contact_count": len(contacts),
+        "numbers": sorted(numbers),
+        "contacts": contacts,
+        "last_error": None,
+    }
+    save_json_file(GOOGLE_CONTACTS_PATH, data)
+
+    LOGGER.info(
+        'Google Contacts sync complete: label="%s" contacts=%s numbers=%s',
+        label,
+        len(contacts),
+        len(numbers),
+    )
+    await fire_home_assistant_event(
+        "spam_call_ai_google_contacts_synced",
+        {
+            "label": label,
+            "contact_count": len(contacts),
+            "number_count": len(numbers),
+        },
+    )
+    return data
+
+
+async def google_contacts_sync_loop() -> None:
+    while True:
+        try:
+            options = load_options()
+            enabled = bool(options.get("google_contacts_enabled", False))
+            authorized = bool(load_json_file(GOOGLE_TOKEN_PATH).get("refresh_token"))
+            if enabled and authorized:
+                try:
+                    await sync_google_contacts(options)
+                except Exception as exc:
+                    LOGGER.warning("Google Contacts sync failed: %s", exc)
+                    previous = load_json_file(GOOGLE_CONTACTS_PATH)
+                    previous["last_error"] = str(exc)
+                    previous["last_error_unix"] = time.time()
+                    save_json_file(GOOGLE_CONTACTS_PATH, previous)
+
+            minutes = int(options.get("google_contacts_sync_minutes", 15))
+            await asyncio.sleep(max(5, minutes) * 60)
+        except asyncio.CancelledError:
+            return
+        except Exception as exc:
+            LOGGER.warning("Google Contacts sync loop error: %s", exc)
+            await asyncio.sleep(300)
+
+
+@app.on_event("startup")
+async def start_google_contacts_sync() -> None:
+    asyncio.create_task(google_contacts_sync_loop(), name="google_contacts_sync")
+
+
 def trusted_caller_numbers(options: dict[str, Any]) -> set[str]:
     raw = str(options.get("trusted_callers") or "")
     numbers: set[str] = set()
@@ -232,6 +507,10 @@ def trusted_caller_numbers(options: dict[str, Any]) -> set[str]:
         number = normalize_phone_number(token)
         if number:
             numbers.add(number)
+
+    if bool(options.get("google_contacts_enabled", False)):
+        numbers.update(google_synced_numbers())
+
     return numbers
 
 
@@ -552,9 +831,232 @@ async def status() -> JSONResponse:
             "twilio_webhook_url": f"{base}/twiml" if base else None,
             "active_calls": len(active_calls),
             "last_call": last_call,
+            "google_contacts": google_contacts_status(),
         }
     )
 
+
+
+
+@app.get("/google/setup", response_class=HTMLResponse)
+async def google_setup_page() -> HTMLResponse:
+    options = load_options()
+    status = google_contacts_status()
+    enabled = bool(options.get("google_contacts_enabled", False))
+    label = str(options.get("google_contact_label") or "Trusted Callers")
+    domain = public_base_url(options)
+    auth_text = "Authorized" if status["authorized"] else "Not authorized yet"
+    last_sync = (
+        time.strftime("%Y-%m-%d %H:%M:%S", time.localtime(status["last_sync_unix"]))
+        if status.get("last_sync_unix")
+        else "Never"
+    )
+    error_html = (
+        f'<p><strong>Last error:</strong> {escape(str(status["last_error"]))}</p>'
+        if status.get("last_error")
+        else ""
+    )
+    html = f"""
+    <!doctype html>
+    <html>
+      <head>
+        <meta name="viewport" content="width=device-width, initial-scale=1">
+        <title>Spam Call AI - Google Contacts</title>
+      </head>
+      <body style="font-family: sans-serif; max-width: 720px; margin: 40px auto; padding: 0 18px;">
+        <h1>Spam Call AI - Google Contacts</h1>
+        <p><strong>Sync enabled:</strong> {"Yes" if enabled else "No"}</p>
+        <p><strong>Label:</strong> {escape(label)}</p>
+        <p><strong>Google authorization:</strong> {auth_text}</p>
+        <p><strong>Last sync:</strong> {escape(last_sync)}</p>
+        <p><strong>Contacts:</strong> {status["contact_count"]} &nbsp;
+           <strong>Phone numbers:</strong> {status["number_count"]}</p>
+        {error_html}
+        <hr>
+        <h2>Authorize Google Contacts</h2>
+        <p>Enter the Google setup key from your Home Assistant app configuration.</p>
+        <form method="post" action="/google/auth/start">
+          <input type="password" name="setup_key" required
+                 placeholder="Google setup key"
+                 style="width:100%;padding:10px;box-sizing:border-box;">
+          <button type="submit" style="margin-top:10px;padding:10px 16px;">Authorize Google Contacts</button>
+        </form>
+        <hr>
+        <h2>Sync now</h2>
+        <form method="post" action="/google/sync">
+          <input type="password" name="setup_key" required
+                 placeholder="Google setup key"
+                 style="width:100%;padding:10px;box-sizing:border-box;">
+          <button type="submit" style="margin-top:10px;padding:10px 16px;">Sync Trusted Callers</button>
+        </form>
+        <p style="margin-top:30px;font-size:0.9em;">
+          OAuth callback: {escape(domain + "/google/oauth/callback")}
+        </p>
+      </body>
+    </html>
+    """
+    return HTMLResponse(html)
+
+
+def validate_google_setup_key(options: dict[str, Any], provided: str) -> None:
+    configured = optional_option(options, "google_setup_key")
+    if not configured:
+        raise HTTPException(status_code=503, detail="google_setup_key is not configured")
+    if not hmac.compare_digest(configured, str(provided or "")):
+        raise HTTPException(status_code=403, detail="Invalid setup key")
+
+
+@app.post("/google/auth/start")
+async def google_auth_start(request: Request) -> RedirectResponse:
+    options = load_options()
+    form = await request.form()
+    validate_google_setup_key(options, str(form.get("setup_key") or ""))
+
+    client_id = optional_option(options, "google_oauth_client_id")
+    client_secret = optional_option(options, "google_oauth_client_secret")
+    if not client_id or not client_secret:
+        raise HTTPException(
+            status_code=503,
+            detail="Google OAuth client ID and client secret must be configured first.",
+        )
+
+    state = secrets.token_urlsafe(32)
+    save_json_file(
+        GOOGLE_STATE_PATH,
+        {"state": state, "expires_at": time.time() + 600},
+    )
+
+    query = urlencode(
+        {
+            "client_id": client_id,
+            "redirect_uri": google_redirect_uri(options),
+            "response_type": "code",
+            "scope": GOOGLE_SCOPE,
+            "access_type": "offline",
+            "include_granted_scopes": "true",
+            "prompt": "consent",
+            "state": state,
+        }
+    )
+    return RedirectResponse(
+        "https://accounts.google.com/o/oauth2/v2/auth?" + query,
+        status_code=303,
+    )
+
+
+@app.get("/google/oauth/callback")
+async def google_oauth_callback(request: Request) -> HTMLResponse:
+    options = load_options()
+    error = str(request.query_params.get("error") or "")
+    if error:
+        return HTMLResponse(
+            f"<h1>Google authorization was not completed</h1><p>{escape(error)}</p>",
+            status_code=400,
+        )
+
+    code = str(request.query_params.get("code") or "")
+    state = str(request.query_params.get("state") or "")
+    expected = load_json_file(GOOGLE_STATE_PATH)
+    expected_state = str(expected.get("state") or "")
+    expires_at = float(expected.get("expires_at") or 0)
+
+    if (
+        not code
+        or not state
+        or not expected_state
+        or expires_at < time.time()
+        or not hmac.compare_digest(state, expected_state)
+    ):
+        raise HTTPException(status_code=400, detail="Invalid or expired OAuth state")
+
+    client_id = optional_option(options, "google_oauth_client_id")
+    client_secret = optional_option(options, "google_oauth_client_secret")
+
+    async with httpx.AsyncClient(timeout=30) as client:
+        response = await client.post(
+            "https://oauth2.googleapis.com/token",
+            data={
+                "code": code,
+                "client_id": client_id,
+                "client_secret": client_secret,
+                "redirect_uri": google_redirect_uri(options),
+                "grant_type": "authorization_code",
+            },
+        )
+        response.raise_for_status()
+        token_response = response.json()
+
+    previous = load_json_file(GOOGLE_TOKEN_PATH)
+    refresh_token = str(
+        token_response.get("refresh_token") or previous.get("refresh_token") or ""
+    )
+    if not refresh_token:
+        raise HTTPException(
+            status_code=500,
+            detail="Google did not return a refresh token. Re-authorize with consent.",
+        )
+
+    token_data = {
+        "access_token": token_response.get("access_token"),
+        "refresh_token": refresh_token,
+        "expires_at": time.time() + int(token_response.get("expires_in", 3600)),
+        "scope": token_response.get("scope", GOOGLE_SCOPE),
+        "token_type": token_response.get("token_type", "Bearer"),
+        "authorized_at_unix": time.time(),
+    }
+    save_json_file(GOOGLE_TOKEN_PATH, token_data)
+    try:
+        GOOGLE_STATE_PATH.unlink(missing_ok=True)
+    except Exception:
+        pass
+
+    try:
+        synced = await sync_google_contacts(options)
+        message = (
+            f'Authorized and synced label "{escape(str(synced["label"]))}". '
+            f'{synced["contact_count"]} contacts / {len(synced["numbers"])} phone numbers loaded.'
+        )
+    except Exception as exc:
+        message = (
+            "Google authorization succeeded, but the first contact sync failed: "
+            + escape(str(exc))
+        )
+
+    return HTMLResponse(
+        f"""
+        <html><body style="font-family:sans-serif;max-width:720px;margin:40px auto;padding:0 18px;">
+        <h1>Google Contacts connected</h1>
+        <p>{message}</p>
+        <p>You can close this page. Spam Call AI will keep the label synced automatically.</p>
+        <p><a href="/google/setup">Return to Google Contacts setup</a></p>
+        </body></html>
+        """
+    )
+
+
+@app.post("/google/sync")
+async def google_sync_now(request: Request) -> HTMLResponse:
+    options = load_options()
+    form = await request.form()
+    validate_google_setup_key(options, str(form.get("setup_key") or ""))
+    try:
+        data = await sync_google_contacts(options)
+        message = (
+            f'Synced "{escape(str(data["label"]))}": '
+            f'{data["contact_count"]} contacts / {len(data["numbers"])} phone numbers.'
+        )
+        return HTMLResponse(
+            f'<html><body style="font-family:sans-serif;max-width:720px;margin:40px auto;padding:0 18px;">'
+            f"<h1>Sync complete</h1><p>{message}</p>"
+            f'<p><a href="/google/setup">Back to setup</a></p></body></html>'
+        )
+    except Exception as exc:
+        return HTMLResponse(
+            f'<html><body style="font-family:sans-serif;max-width:720px;margin:40px auto;padding:0 18px;">'
+            f"<h1>Sync failed</h1><p>{escape(str(exc))}</p>"
+            f'<p><a href="/google/setup">Back to setup</a></p></body></html>',
+            status_code=500,
+        )
 
 
 @app.post("/transfer")
@@ -629,11 +1131,17 @@ async def twiml(request: Request) -> Response:
 
     if trusted_rering and destination and is_trusted_caller(options, caller):
         timeout = int(options.get("trusted_rering_timeout_seconds", 15))
-        LOGGER.info("Trusted caller recognized; re-ringing the cell: caller=%s", caller)
+        trusted_name = google_synced_name_for_number(caller)
+        LOGGER.info(
+            "Trusted caller recognized; re-ringing the cell: caller=%s name=%s",
+            caller,
+            trusted_name or "manual-list",
+        )
         await fire_home_assistant_event(
             "spam_call_ai_trusted_caller_rering",
             {
                 "caller": caller,
+                "trusted_name": trusted_name,
                 "call_sid": call_sid,
                 "destination_configured": True,
             },

@@ -1,5 +1,5 @@
 name: "Spam Call AI"
-version: "0.2.0"
+version: "0.3.0"
 slug: "spam_call_ai"
 description: "AI voice screening for inbound Twilio calls using OpenAI GPT-Live"
 url: "https://github.com/jandsodonnell-code/home-assistant-spam-call-ai"
@@ -24,6 +24,8 @@ options:
   ngrok_domain: "wand-mold-displace.ngrok-free.dev"
   auto_tunnel: false
   max_call_minutes: 10
+  analyze_calls: true
+  analysis_model: "gpt-6-luna"
   voice: "marin"
   greeting: "Hi, you've reached the automated call assistant. Who's calling, and what are you calling about?"
   validate_twilio_signature: true
@@ -36,6 +38,8 @@ schema:
   auto_tunnel: bool
   public_base_url: "str?"
   max_call_minutes: "int(1,60)"
+  analyze_calls: bool
+  analysis_model: str
   voice: str
   greeting: str
   validate_twilio_signature: bool

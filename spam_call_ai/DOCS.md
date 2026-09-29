@@ -3,16 +3,15 @@
 This Home Assistant app answers inbound Twilio calls and bridges the caller's
 audio to OpenAI GPT-Live.
 
-## Version 0.1.0
+## Version 0.1.1
 
-This first version is intentionally isolated:
+Version 0.1.1 adds an automatic Cloudflare Quick Tunnel for initial testing.
+This means you do not need to expose Home Assistant itself or configure a
+separate tunnel before your first test.
 
-- Every call to the Twilio number is answered by the automated assistant.
-- It does not transfer legitimate callers yet.
-- It does not place outbound calls.
-- It does not handle SMS yet.
-- A maximum call length is enforced.
-- The app fires Home Assistant events when a call starts and ends.
+Cloudflare Quick Tunnels are intended only for testing. Their public URL changes
+whenever the app or tunnel restarts. After testing, switch to a stable named
+tunnel or another stable HTTPS hostname.
 
 ## Required configuration
 
@@ -28,21 +27,35 @@ This begins with `AC`.
 
 Use the Auth Token from the Twilio Console. Keep it private.
 
-A Twilio API Key SID/Secret is not required by version 0.1.0 because this
-version only receives Twilio webhooks and Media Streams.
+## Public access
 
-### Public Base URL
+### Easiest testing setup
 
-The app must be reachable by Twilio over public HTTPS/WSS.
+Leave:
 
-Example:
+- `auto_tunnel: true`
+- `public_base_url` blank
 
-`https://spam-ai.example.com`
+When the app starts, it will create a free temporary
+`https://....trycloudflare.com` URL and print two lines in the app log:
 
-Do not include `/twiml` or `/media` in this setting.
+- `PUBLIC BASE URL: ...`
+- `TWILIO WEBHOOK: .../twiml`
 
-For initial testing, expose only this app's port 8000 through a secure tunnel.
-Do not expose the entire Home Assistant interface just for this app.
+Use the TWILIO WEBHOOK value in Twilio.
+
+The temporary URL changes if the app restarts, so you must update Twilio after
+a restart during testing.
+
+### Stable production setup
+
+Later, set `auto_tunnel: false` and enter a stable HTTPS URL in
+`public_base_url`. A named Cloudflare Tunnel is one option.
+
+Do not point this app at your normal Home Assistant URL unless you have
+explicitly configured a reverse proxy route for this app.
+
+## Other options
 
 ### Maximum Call Minutes
 
@@ -50,14 +63,18 @@ Start with 10 minutes to control API usage.
 
 ### Voice
 
-The default is `gleam`. You can enter another GPT-Live built-in voice ID.
+The default is `marin`, a GPT-Live built-in voice.
+
+### Greeting
+
+This is spoken by Twilio before the live AI audio stream starts.
 
 ## Twilio webhook
 
-After the app is running and the public URL works, configure the Twilio number:
+After the app is running:
 
 - Incoming call method: Webhook
-- Webhook URL: `https://YOUR-PUBLIC-HOST/twiml`
+- Webhook URL: copy the `TWILIO WEBHOOK` line from the app log
 - HTTP method: POST
 
 The app validates Twilio's HTTP signature by default.
@@ -74,13 +91,10 @@ caller/assistant transcript text.
 
 ## Useful endpoints
 
-- `/health` - health and configuration status
-- `/status` - active-call count and last-call data
+- `/health` - health/configuration status and public URL
+- `/status` - public URL, Twilio webhook URL, active-call count, last call
 - `/twiml` - Twilio inbound voice webhook
 - `/media/<secret>` - private bidirectional Twilio Media Stream endpoint
-
-The media-path secret is derived from your Twilio Auth Token and is not shown
-in the Home Assistant UI.
 
 ## Security notes
 
@@ -88,8 +102,8 @@ in the Home Assistant UI.
 - Keep Twilio signature validation enabled except during controlled debugging.
 - Use a dedicated OpenAI project/key and set a project spending limit.
 - Use a maximum call duration.
-- This app never intentionally gives the voice model Home Assistant control,
-  email access, contacts, financial access, or other private tools.
+- The voice model is not given Home Assistant control, email access, contacts,
+  financial access, or other private tools.
 
 ## Testing
 
@@ -97,5 +111,4 @@ Call the Twilio number from a verified caller if your Twilio account is still
 on trial.
 
 Try a legitimate-caller scenario and a fake telemarketing scenario. Do not use
-real account numbers, passwords, verification codes, or financial details in
-tests.
+real account numbers, passwords, verification codes, or financial details.

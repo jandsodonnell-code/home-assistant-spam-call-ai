@@ -26,7 +26,7 @@ LAST_CALL_PATH = Path("/data/last_call.json")
 PUBLIC_URL_PATH = Path("/data/public_url.txt")
 OPENAI_LIVE_URL = "wss://api.openai.com/v1/live/sessions"
 
-app = FastAPI(title="Spam Call AI", version="0.1.1")
+app = FastAPI(title="Spam Call AI", version="0.3.0")
 active_calls: dict[str, dict[str, Any]] = {}
 
 
@@ -71,6 +71,143 @@ def media_ws_url(options: dict[str, Any]) -> str:
 
 def safety_identifier(value: str) -> str:
     return hashlib.sha256(value.encode("utf-8")).hexdigest()
+
+
+CALL_ANALYSIS_SCHEMA = {
+    "type": "object",
+    "properties": {
+        "classification": {
+            "type": "string",
+            "enum": ["legitimate", "telemarketing", "scam", "robocall", "unknown"],
+        },
+        "spam_likelihood": {
+            "type": "number",
+            "minimum": 0,
+            "maximum": 1,
+        },
+        "caller_name": {"type": "string"},
+        "organization": {"type": "string"},
+        "reason": {"type": "string"},
+        "callback_number": {"type": "string"},
+        "summary": {"type": "string"},
+        "recommended_action": {
+            "type": "string",
+            "enum": ["allow", "block", "review"],
+        },
+        "signals": {
+            "type": "array",
+            "items": {"type": "string"},
+            "maxItems": 5,
+        },
+    },
+    "required": [
+        "classification",
+        "spam_likelihood",
+        "caller_name",
+        "organization",
+        "reason",
+        "callback_number",
+        "summary",
+        "recommended_action",
+        "signals",
+    ],
+    "additionalProperties": False,
+}
+
+
+def extract_response_output_text(payload: dict[str, Any]) -> str:
+    for item in payload.get("output", []):
+        if item.get("type") != "message":
+            continue
+        for content in item.get("content", []):
+            if content.get("type") == "output_text" and content.get("text"):
+                return str(content["text"])
+    return ""
+
+
+async def analyze_call(
+    options: dict[str, Any],
+    caller: str,
+    transcripts: dict[str, str],
+) -> dict[str, Any] | None:
+    if not bool(options.get("analyze_calls", True)):
+        return None
+
+    caller_text = transcripts.get("caller", "").strip()
+    assistant_text = transcripts.get("assistant", "").strip()
+    if not caller_text and not assistant_text:
+        return {
+            "classification": "unknown",
+            "spam_likelihood": 0.5,
+            "caller_name": "",
+            "organization": "",
+            "reason": "",
+            "callback_number": "",
+            "summary": "No usable transcript was captured.",
+            "recommended_action": "review",
+            "signals": [],
+        }
+
+    api_key = required_option(options, "openai_api_key")
+    model = str(options.get("analysis_model") or "gpt-6-luna").strip()
+
+    transcript = (
+        "CALLER TRANSCRIPT:\n"
+        + caller_text[-8000:]
+        + "\n\nASSISTANT TRANSCRIPT:\n"
+        + assistant_text[-8000:]
+    )
+
+    system_prompt = (
+        "Analyze an inbound phone screening transcript. Use only facts present in "
+        "the transcript. Do not guess identity or intent when evidence is weak. "
+        "Classify obvious unsolicited sales as telemarketing, deceptive/fraudulent "
+        "requests as scam, automated non-human calls as robocall, normal personal "
+        "or business calls with a clear legitimate purpose as legitimate, and use "
+        "unknown when the evidence is insufficient. Extract a callback number only "
+        "if the caller actually stated one. Keep the summary brief. The signals "
+        "field must contain only short factual observations from the transcript, "
+        "not hidden reasoning or chain-of-thought."
+    )
+
+    request_payload = {
+        "model": model,
+        "store": False,
+        "input": [
+            {"role": "system", "content": system_prompt},
+            {"role": "user", "content": transcript},
+        ],
+        "max_output_tokens": 500,
+        "text": {
+            "format": {
+                "type": "json_schema",
+                "name": "call_analysis",
+                "strict": True,
+                "schema": CALL_ANALYSIS_SCHEMA,
+            }
+        },
+    }
+
+    headers = {
+        "Authorization": f"Bearer {api_key}",
+        "Content-Type": "application/json",
+        "OpenAI-Safety-Identifier": safety_identifier(caller or "unknown-caller"),
+    }
+
+    async with httpx.AsyncClient(timeout=45) as client:
+        response = await client.post(
+            "https://api.openai.com/v1/responses",
+            headers=headers,
+            json=request_payload,
+        )
+        response.raise_for_status()
+        payload = response.json()
+
+    output_text = extract_response_output_text(payload)
+    if not output_text:
+        raise RuntimeError("OpenAI call analysis returned no output text")
+
+    return json.loads(output_text)
 
 
 def prompt_text() -> str:
@@ -484,6 +621,30 @@ async def media(websocket: WebSocket, token: str) -> None:
             "assistant_transcript": transcripts["assistant"][-4000:],
             "ended_at_unix": time.time(),
         }
+
+        try:
+            analysis = await analyze_call(options, caller, transcripts)
+            if analysis is not None:
+                result["analysis"] = analysis
+                LOGGER.info(
+                    "Call analysis: classification=%s spam_likelihood=%s action=%s",
+                    analysis.get("classification"),
+                    analysis.get("spam_likelihood"),
+                    analysis.get("recommended_action"),
+                )
+                await fire_home_assistant_event(
+                    "spam_call_ai_call_analyzed",
+                    {
+                        "caller": caller,
+                        "call_sid": call_sid,
+                        "duration_seconds": duration,
+                        **analysis,
+                    },
+                )
+        except Exception as exc:
+            LOGGER.warning("Call analysis failed: %s", exc)
+            result["analysis_error"] = str(exc)
+
         save_last_call(result)
         await fire_home_assistant_event("spam_call_ai_call_ended", result)
 

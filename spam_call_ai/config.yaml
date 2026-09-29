@@ -1,5 +1,5 @@
 name: "Spam Call AI"
-version: "0.4.1"
+version: "0.5.0"
 slug: "spam_call_ai"
 description: "AI voice screening for inbound Twilio calls using OpenAI GPT-Live"
 url: "https://github.com/jandsodonnell-code/home-assistant-spam-call-ai"
@@ -27,6 +27,9 @@ options:
   analyze_calls: true
   analysis_model: "gpt-6-luna"
   live_transfer_enabled: false
+  trusted_rering_enabled: true
+  trusted_callers: ""
+  trusted_rering_timeout_seconds: 15
   transfer_min_confidence: 0.92
   transfer_timeout_seconds: 25
   voice: "marin"
@@ -44,6 +47,9 @@ schema:
   analyze_calls: bool
   analysis_model: str
   live_transfer_enabled: bool
+  trusted_rering_enabled: bool
+  trusted_callers: str
+  trusted_rering_timeout_seconds: "int(5,30)"
   forward_to_number: "str?"
   transfer_min_confidence: "float(0.5,1.0)"
   transfer_timeout_seconds: "int(10,60)"

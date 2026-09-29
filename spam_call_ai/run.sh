@@ -29,6 +29,14 @@ done
 PUBLIC_URL="$(bashio::config 'public_base_url' 2>/dev/null || true)"
 AUTO_TUNNEL="$(bashio::config 'auto_tunnel' 2>/dev/null || echo true)"
 
+# Home Assistant may return the JSON literal "null" for an unused optional option.
+# Treat null/None as empty so the automatic test tunnel can start.
+case "${PUBLIC_URL}" in
+  null|NULL|None|none|""null""|"""")
+    PUBLIC_URL=""
+    ;;
+esac
+
 if [[ -n "${PUBLIC_URL}" ]]; then
   printf '%s\n' "${PUBLIC_URL%/}" > /data/public_url.txt
   bashio::log.info "Using configured public base URL: ${PUBLIC_URL%/}"

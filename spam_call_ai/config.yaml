@@ -31,9 +31,6 @@ options:
   trusted_callers: ""
   trusted_rering_timeout_seconds: 15
   google_contacts_enabled: false
-  google_oauth_client_id: null
-  google_oauth_client_secret: null
-  google_setup_key: null
   google_contact_label: "Trusted Callers"
   google_contacts_sync_minutes: 15
   transfer_min_confidence: 0.92

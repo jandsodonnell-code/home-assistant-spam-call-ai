@@ -3,6 +3,7 @@ import hashlib
 import json
 import logging
 import os
+import re
 import time
 from pathlib import Path
 from typing import Any
@@ -27,7 +28,7 @@ LAST_CALL_PATH = Path("/data/last_call.json")
 PUBLIC_URL_PATH = Path("/data/public_url.txt")
 OPENAI_LIVE_URL = "wss://api.openai.com/v1/live/sessions"
 
-app = FastAPI(title="Spam Call AI", version="0.4.1")
+app = FastAPI(title="Spam Call AI", version="0.5.0")
 active_calls: dict[str, dict[str, Any]] = {}
 
 
@@ -209,6 +210,61 @@ async def analyze_call(
         raise RuntimeError("OpenAI call analysis returned no output text")
 
     return json.loads(output_text)
+
+
+
+def normalize_phone_number(value: str) -> str:
+    raw = str(value or "").strip()
+    if not raw:
+        return ""
+    digits = re.sub(r"\D", "", raw)
+    if len(digits) == 10:
+        digits = "1" + digits
+    if digits:
+        return "+" + digits
+    return ""
+
+
+def trusted_caller_numbers(options: dict[str, Any]) -> set[str]:
+    raw = str(options.get("trusted_callers") or "")
+    numbers: set[str] = set()
+    for token in re.split(r"[,;\s]+", raw):
+        number = normalize_phone_number(token)
+        if number:
+            numbers.add(number)
+    return numbers
+
+
+def is_trusted_caller(options: dict[str, Any], caller: str) -> bool:
+    return normalize_phone_number(caller) in trusted_caller_numbers(options)
+
+
+def ai_stream_xml(
+    options: dict[str, Any],
+    caller: str,
+    call_sid: str,
+    to_number: str,
+    include_greeting: bool = True,
+) -> str:
+    greeting = str(options.get("greeting") or "").strip()
+    stream_url = media_ws_url(options)
+
+    parameter_xml = (
+        f'<Parameter name="caller" value={quoteattr(caller)} />'
+        f'<Parameter name="callSid" value={quoteattr(call_sid)} />'
+        f'<Parameter name="to" value={quoteattr(to_number)} />'
+    )
+    say_xml = (
+        f"<Say>{escape(greeting)}</Say>"
+        if include_greeting and greeting
+        else ""
+    )
+    return (
+        f"{say_xml}"
+        "<Connect>"
+        f"<Stream url={quoteattr(stream_url)}>{parameter_xml}</Stream>"
+        "</Connect>"
+    )
 
 
 def transfer_is_configured(options: dict[str, Any]) -> bool:
@@ -554,23 +610,68 @@ async def twiml(request: Request) -> Response:
     if account_sid and account_sid != expected_account:
         raise HTTPException(status_code=403, detail="Unexpected Twilio account")
 
-    greeting = str(options.get("greeting") or "").strip()
-    stream_url = media_ws_url(options)
+    caller_norm = normalize_phone_number(caller)
+    to_norm = normalize_phone_number(to_number)
 
-    parameter_xml = (
-        f'<Parameter name="caller" value={quoteattr(caller)} />'
-        f'<Parameter name="callSid" value={quoteattr(call_sid)} />'
-        f'<Parameter name="to" value={quoteattr(to_number)} />'
-    )
+    # Loop guard: trusted re-ring uses the Twilio number as outbound caller ID.
+    # If that second ring is itself conditionally forwarded back to Twilio,
+    # From and To are the Twilio number. End that child call instead of re-ringing.
+    if caller_norm and to_norm and caller_norm == to_norm:
+        LOGGER.info("Stopped trusted-caller re-ring loop for call_sid=%s", call_sid)
+        xml = (
+            '<?xml version="1.0" encoding="UTF-8"?>'
+            "<Response><Hangup/></Response>"
+        )
+        return Response(content=xml, media_type="application/xml")
 
-    say_xml = f"<Say>{escape(greeting)}</Say>" if greeting else ""
+    trusted_rering = bool(options.get("trusted_rering_enabled", True))
+    destination = str(options.get("forward_to_number") or "").strip()
+
+    if trusted_rering and destination and is_trusted_caller(options, caller):
+        timeout = int(options.get("trusted_rering_timeout_seconds", 15))
+        LOGGER.info("Trusted caller recognized; re-ringing the cell: caller=%s", caller)
+        await fire_home_assistant_event(
+            "spam_call_ai_trusted_caller_rering",
+            {
+                "caller": caller,
+                "call_sid": call_sid,
+                "destination_configured": True,
+            },
+        )
+
+        # Use the Twilio number as caller ID on the second ring. That makes a
+        # conditionally-forwarded unanswered second ring easy to identify and
+        # terminate above, preventing an infinite forwarding loop.
+        dial_xml = (
+            f'<Dial answerOnBridge="true" timeout="{timeout}" '
+            f'callerId={quoteattr(to_number)}>'
+            f"<Number>{escape(destination)}</Number>"
+            "</Dial>"
+        )
+
+        # If the second ring is not answered, continue the original family call
+        # into the AI so it can take a message.
+        fallback_xml = ai_stream_xml(
+            options,
+            caller,
+            call_sid,
+            to_number,
+            include_greeting=True,
+        )
+        xml = (
+            '<?xml version="1.0" encoding="UTF-8"?>'
+            "<Response>"
+            f"{dial_xml}"
+            f"{fallback_xml}"
+            "<Hangup/>"
+            "</Response>"
+        )
+        return Response(content=xml, media_type="application/xml")
+
     xml = (
         '<?xml version="1.0" encoding="UTF-8"?>'
         "<Response>"
-        f"{say_xml}"
-        "<Connect>"
-        f"<Stream url={quoteattr(stream_url)}>{parameter_xml}</Stream>"
-        "</Connect>"
+        f"{ai_stream_xml(options, caller, call_sid, to_number, include_greeting=True)}"
         "<Hangup/>"
         "</Response>"
     )

@@ -40,6 +40,7 @@ RUN python3 -m venv /opt/venv \
   && /opt/venv/bin/pip install --no-cache-dir -r /app/requirements.txt
 
 COPY app.py /app/app.py
+COPY safe_routes.py /app/safe_routes.py
 COPY run.sh /run.sh
 
 RUN chmod a+x /run.sh

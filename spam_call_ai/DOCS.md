@@ -3,7 +3,7 @@
 This Home Assistant app answers inbound Twilio calls and bridges the caller's
 audio to OpenAI GPT-Live.
 
-## Version 0.7.0
+## Version 0.8.0
 
 Version 0.7.0 treats trusted contacts as true safe callers. Safe callers are matched before any OpenAI media stream is opened. They are re-rung to the cell once, and if that second attempt is not answered, Twilio records a normal voicemail instead of sending the caller to AI. Transfer is disabled by default. When enabled, GPT-Live may delegate a transfer decision to the Responses backend. The backend can request a transfer only when the caller explicitly asks to speak with the owner and the call appears clearly legitimate. The server independently enforces the confidence threshold before asking Twilio to redirect the active call to a <Dial> transfer.
 
@@ -305,3 +305,40 @@ The safe-call events are:
 
 The safe voicemail maximum length is controlled by
 `safe_voicemail_max_seconds` and defaults to 120 seconds.
+
+
+## Dashboard entities in 0.8.0
+
+Version 0.8.0 publishes Home Assistant entities for the Spam Call AI dashboard.
+They are refreshed automatically while the app is running.
+
+- `binary_sensor.spam_call_ai_online`
+- `sensor.spam_call_ai_active_calls`
+- `sensor.spam_call_ai_safe_contacts`
+- `sensor.spam_call_ai_last_call`
+- `sensor.spam_call_ai_last_caller`
+- `sensor.spam_call_ai_last_caller_name`
+- `sensor.spam_call_ai_last_call_type`
+- `sensor.spam_call_ai_last_classification`
+- `sensor.spam_call_ai_last_spam_likelihood`
+- `sensor.spam_call_ai_last_action`
+- `sensor.spam_call_ai_last_duration`
+- `sensor.spam_call_ai_last_summary`
+- `sensor.spam_call_ai_last_callback_number`
+- `sensor.spam_call_ai_last_call_time`
+- `sensor.spam_call_ai_google_sync_status`
+- `sensor.spam_call_ai_google_last_sync`
+
+The safe-contact sensor lists the current Google Contact names in its `contacts`
+attribute. Manual trusted numbers are shown as `Manual: +1...`.
+
+Safe callers remain a strict no-AI path. The dashboard records whether the most
+recent call was a Safe caller or AI screened. Safe callers that are not answered
+on the second ring go to conventional Twilio voicemail; their audio is not sent
+to OpenAI.
+
+A complete built-in Home Assistant card is included at:
+
+`spam_call_ai/dashboard-card.yaml`
+
+It uses only built-in Markdown and Entities cards and does not require HACS.

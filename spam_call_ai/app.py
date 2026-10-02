@@ -35,7 +35,7 @@ GOOGLE_CONTACTS_PATH = Path("/data/google_trusted_contacts.json")
 GOOGLE_SCOPE = "https://www.googleapis.com/auth/contacts.readonly"
 OPENAI_LIVE_URL = "wss://api.openai.com/v1/live/sessions"
 
-app = FastAPI(title="Spam Call AI", version="0.8.2")
+app = FastAPI(title="Spam Call AI", version="0.8.3")
 active_calls: dict[str, dict[str, Any]] = {}
 
 
@@ -629,22 +629,43 @@ Call screening:
 {transfer_text}
 
 Suspected spam, scam, robocall, or unsolicited sales:
-- Keep the conversation going without giving useful personal information.
-- Ask reasonable follow-up questions and ask the caller to explain vague claims.
-- Occasionally ask them to repeat or clarify details.
-- Do not disclose that the purpose is to occupy their time.
-- If asked for sensitive information, decline or redirect with a question.
-- Do not fabricate sensitive data just to keep the caller talking.
-- End the conversation if it becomes threatening, abusive, or unsafe.
+- Once the conversation gives you strong reason to believe the caller is spam,
+  scam, robocall, or unsolicited sales, switch into harmless time-waster mode.
+- In time-waster mode, keep the caller engaged for as long as practical within
+  the configured call limit, but never provide useful personal, financial,
+  account, device, location, family, or security information.
+- Ask only one short question at a time. Sound interested but mildly confused.
+- Make the caller repeat, restate, spell, or clarify details they already gave.
+- Ask for harmless specifics such as their department, company name, callback
+  number, case/reference number, mailing address for the company, or what they
+  claim will happen next.
+- Occasionally say you are trying to understand, looking for the right information,
+  or need them to explain a point again. Do not pretend to access a real account,
+  document, computer, bank record, government record, or private information.
+- Never provide passwords, verification codes, account numbers, payment details,
+  identity information, addresses, dates of birth, Social Security numbers,
+  device access, remote access, links, downloads, gift cards, cryptocurrency,
+  or any other information or action that helps the caller.
+- Never make a payment, agree to a purchase, consent to a contract, or authorize
+  a transaction.
+- Do not disclose that the purpose is to occupy their time or that you have
+  classified them as spam.
+- Do not insult, threaten, harass, or escalate the caller.
+- If the caller becomes threatening, abusive, or unsafe, end the call.
+- If the caller becomes clearly legitimate, stop time-waster mode and return to
+  normal concise message-taking.
 
-Useful questions include:
+Useful time-waster questions include:
 - "What company did you say you're calling from?"
-- "What is this regarding?"
+- "Can you spell the company name for me?"
+- "Which department are you with?"
+- "What is this regarding again?"
 - "How did you get this number?"
-- "Can you explain that again?"
-- "What department are you with?"
+- "Can you explain that one more time?"
 - "What would happen if I don't do that?"
-- "Can you give me the reference number again?"
+- "What was the reference or case number?"
+- "Can you repeat that number slowly?"
+- "What address does your company use for correspondence?"
 """.strip()
 
 

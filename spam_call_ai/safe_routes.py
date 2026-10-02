@@ -53,6 +53,7 @@ async def _publish_safe_contacts_sensor() -> None:
 
     token = os.environ.get("SUPERVISOR_TOKEN")
     if not token:
+        LOGGER.error("Safe contacts sensor: SUPERVISOR_TOKEN is unavailable")
         return
 
     payload = {
@@ -84,11 +85,18 @@ async def _publish_safe_contacts_sensor() -> None:
                 json=payload,
             )
             response.raise_for_status()
+            LOGGER.info(
+                "Safe contacts sensor published: entity=sensor.spam_call_ai_safe_contacts count=%s names=%s",
+                len(safe_numbers),
+                len(names),
+            )
     except Exception as exc:
         LOGGER.warning("Could not publish safe contacts sensor: %s", exc)
 
 
 async def _safe_contacts_sensor_loop() -> None:
+    LOGGER.info("Safe contacts sensor publisher started")
+    await asyncio.sleep(5)
     while True:
         try:
             await _publish_safe_contacts_sensor()

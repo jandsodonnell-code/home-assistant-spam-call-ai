@@ -35,7 +35,8 @@ GOOGLE_CONTACTS_PATH = Path("/data/google_trusted_contacts.json")
 GOOGLE_SCOPE = "https://www.googleapis.com/auth/contacts.readonly"
 OPENAI_LIVE_URL = "wss://api.openai.com/v1/live/sessions"
 
-app = FastAPI(title="Spam Call AI", version="0.8.5")
+APP_VERSION = "0.8.6"
+app = FastAPI(title="Spam Call AI", version=APP_VERSION)
 active_calls: dict[str, dict[str, Any]] = {}
 
 
@@ -498,6 +499,11 @@ async def google_contacts_sync_loop() -> None:
 @app.on_event("startup")
 async def start_google_contacts_sync() -> None:
     asyncio.create_task(google_contacts_sync_loop(), name="google_contacts_sync")
+
+
+@app.on_event("startup")
+async def log_application_version() -> None:
+    LOGGER.info("Spam Call AI application code version %s", APP_VERSION)
 
 
 def trusted_caller_numbers(options: dict[str, Any]) -> set[str]:
@@ -1233,29 +1239,40 @@ async def send_live_instruction(openai_ws, content: str, event_id: str) -> None:
     )
 
 
-async def wait_for_assistant_audio_to_settle(
+async def wait_for_assistant_prompt_generation(
     activity: dict[str, Any],
-    baseline: float = 0.0,
-    start_timeout: float = 12.0,
-    quiet_seconds: float = 1.5,
+    baseline_transcript_end_ms: float = 0.0,
+    timeout_seconds: float = 12.0,
+    transcript_quiet_seconds: float = 0.9,
 ) -> bool:
-    deadline = time.monotonic() + start_timeout
+    """
+    GPT-Live does not emit a per-utterance audio-done event. Instead, wait for
+    a new assistant transcript fragment, then wait until transcript delivery is
+    briefly quiet and the output-audio timeline has caught up to that transcript.
+    This avoids getting stuck if GPT-Live keeps sending silent audio packets.
+    """
+    deadline = time.monotonic() + timeout_seconds
+    saw_new_transcript = False
 
     while time.monotonic() < deadline:
-        last_audio = float(activity.get("assistant_audio_last") or 0.0)
-        if last_audio > baseline:
-            while True:
-                await asyncio.sleep(0.15)
-                newest = float(activity.get("assistant_audio_last") or 0.0)
-                if newest > last_audio:
-                    last_audio = newest
-                    continue
-                if time.monotonic() - newest >= quiet_seconds:
-                    return True
-        await asyncio.sleep(0.1)
+        transcript_end_ms = float(activity.get("assistant_transcript_end_ms") or 0.0)
+        audio_end_ms = float(activity.get("assistant_audio_end_ms") or 0.0)
+        transcript_last = float(activity.get("assistant_transcript_last") or 0.0)
+
+        if transcript_end_ms > baseline_transcript_end_ms:
+            saw_new_transcript = True
+
+        if (
+            saw_new_transcript
+            and transcript_last > 0
+            and time.monotonic() - transcript_last >= transcript_quiet_seconds
+            and audio_end_ms + 100 >= transcript_end_ms
+        ):
+            return True
+
+        await asyncio.sleep(0.10)
 
     return False
-
 
 async def wait_for_twilio_playback(
     twilio_ws: WebSocket,
@@ -1319,8 +1336,15 @@ async def initial_silence_monitor(
     initial_wait = int(options.get("initial_response_timeout_seconds", 8))
     second_wait = int(options.get("second_response_timeout_seconds", 7))
 
+    LOGGER.info(
+        "Initial silence monitor started: first=%ss second=%ss",
+        initial_wait,
+        second_wait,
+    )
+
     # Open with GPT-Live itself so the greeting voice is identical to the
     # conversational voice configured for this session.
+    opening_baseline = float(activity.get("assistant_transcript_end_ms") or 0.0)
     await send_live_instruction(
         openai_ws,
         (
@@ -1331,9 +1355,15 @@ async def initial_silence_monitor(
         "opening_greeting",
     )
 
-    greeting_finished = await wait_for_assistant_audio_to_settle(activity)
+    LOGGER.info("Opening greeting instruction sent to GPT-Live")
+    greeting_finished = await wait_for_assistant_prompt_generation(
+        activity,
+        baseline_transcript_end_ms=opening_baseline,
+    )
     if not greeting_finished:
-        LOGGER.warning("Opening greeting audio was not detected; silence retry monitor stopped")
+        LOGGER.warning(
+            "Opening greeting generation could not be confirmed; silence retry monitor stopped"
+        )
         return
 
     greeting_played = await wait_for_twilio_playback(
@@ -1363,7 +1393,7 @@ async def initial_silence_monitor(
         "Caller remained silent for %ss after opening greeting; asking one more time",
         initial_wait,
     )
-    baseline = float(activity.get("assistant_audio_last") or 0.0)
+    retry_baseline = float(activity.get("assistant_transcript_end_ms") or 0.0)
     await send_live_instruction(
         openai_ws,
         (
@@ -1374,12 +1404,13 @@ async def initial_silence_monitor(
         "silence_retry",
     )
 
-    retry_finished = await wait_for_assistant_audio_to_settle(
+    LOGGER.info("Second silence prompt instruction sent to GPT-Live")
+    retry_finished = await wait_for_assistant_prompt_generation(
         activity,
-        baseline=baseline,
+        baseline_transcript_end_ms=retry_baseline,
     )
     if not retry_finished:
-        LOGGER.warning("Second silence prompt audio was not detected; leaving call open")
+        LOGGER.warning("Second silence prompt generation could not be confirmed; leaving call open")
         return
 
     retry_played = await wait_for_twilio_playback(
@@ -1467,6 +1498,13 @@ async def openai_to_twilio(
             delta = event.get("delta")
             if delta:
                 activity["assistant_audio_last"] = time.monotonic()
+                try:
+                    activity["assistant_audio_end_ms"] = max(
+                        float(activity.get("assistant_audio_end_ms") or 0.0),
+                        float(event.get("end_ms") or 0.0),
+                    )
+                except (TypeError, ValueError):
+                    pass
                 await twilio_ws.send_json(
                     {
                         "event": "media",
@@ -1484,7 +1522,17 @@ async def openai_to_twilio(
                 LOGGER.debug("Caller transcript activity detected during live call")
 
         elif event_type == "session.output_transcript.delta":
-            transcripts["assistant"] += str(event.get("delta") or "")
+            delta = str(event.get("delta") or "")
+            transcripts["assistant"] += delta
+            if delta:
+                activity["assistant_transcript_last"] = time.monotonic()
+                try:
+                    activity["assistant_transcript_end_ms"] = max(
+                        float(activity.get("assistant_transcript_end_ms") or 0.0),
+                        float(event.get("end_ms") or 0.0),
+                    )
+                except (TypeError, ValueError):
+                    pass
 
         elif event_type == "session.delegation.created":
             delegation = event.get("delegation") or {}
@@ -1556,6 +1604,9 @@ async def media(websocket: WebSocket, token: str) -> None:
         "caller_spoke": False,
         "caller_transcript_last": 0.0,
         "assistant_audio_last": 0.0,
+        "assistant_audio_end_ms": 0.0,
+        "assistant_transcript_last": 0.0,
+        "assistant_transcript_end_ms": 0.0,
         "twilio_marks_seen": set(),
     }
 

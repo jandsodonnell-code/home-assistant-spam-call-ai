@@ -35,7 +35,7 @@ GOOGLE_CONTACTS_PATH = Path("/data/google_trusted_contacts.json")
 GOOGLE_SCOPE = "https://www.googleapis.com/auth/contacts.readonly"
 OPENAI_LIVE_URL = "wss://api.openai.com/v1/live/sessions"
 
-app = FastAPI(title="Spam Call AI", version="0.8.4")
+app = FastAPI(title="Spam Call AI", version="0.8.5")
 active_calls: dict[str, dict[str, Any]] = {}
 
 
@@ -1282,16 +1282,24 @@ async def wait_for_twilio_playback(
     return False
 
 
-async def caller_has_spoken(
+async def caller_has_spoken_since(
     activity: dict[str, Any],
+    since_monotonic: float,
     timeout_seconds: float,
 ) -> bool:
+    """
+    Only count caller speech/transcription that arrives after the prompt has
+    actually finished playing. This prevents line noise or partial transcripts
+    captured during the greeting from disabling the silence retry.
+    """
     deadline = time.monotonic() + timeout_seconds
     while time.monotonic() < deadline:
-        if bool(activity.get("caller_spoke")):
+        last_transcript = float(activity.get("caller_transcript_last") or 0.0)
+        if last_transcript > since_monotonic:
             return True
-        await asyncio.sleep(0.15)
-    return bool(activity.get("caller_spoke"))
+        await asyncio.sleep(0.10)
+
+    return float(activity.get("caller_transcript_last") or 0.0) > since_monotonic
 
 
 async def initial_silence_monitor(
@@ -1328,9 +1336,6 @@ async def initial_silence_monitor(
         LOGGER.warning("Opening greeting audio was not detected; silence retry monitor stopped")
         return
 
-    if bool(activity.get("caller_spoke")):
-        return
-
     greeting_played = await wait_for_twilio_playback(
         twilio_ws,
         stream_sid,
@@ -1341,11 +1346,17 @@ async def initial_silence_monitor(
         LOGGER.warning("Twilio did not confirm opening greeting playback; silence retry monitor stopped")
         return
 
+    initial_listen_started = time.monotonic()
     LOGGER.info(
         "Opening greeting playback complete; starting %ss silence timer",
         initial_wait,
     )
-    if await caller_has_spoken(activity, initial_wait):
+    if await caller_has_spoken_since(
+        activity,
+        initial_listen_started,
+        initial_wait,
+    ):
+        LOGGER.info("Caller speech detected during initial response window")
         return
 
     LOGGER.info(
@@ -1371,9 +1382,6 @@ async def initial_silence_monitor(
         LOGGER.warning("Second silence prompt audio was not detected; leaving call open")
         return
 
-    if bool(activity.get("caller_spoke")):
-        return
-
     retry_played = await wait_for_twilio_playback(
         twilio_ws,
         stream_sid,
@@ -1384,11 +1392,17 @@ async def initial_silence_monitor(
         LOGGER.warning("Twilio did not confirm second prompt playback; leaving call open")
         return
 
+    second_listen_started = time.monotonic()
     LOGGER.info(
         "Second prompt playback complete; starting %ss silence timer",
         second_wait,
     )
-    if await caller_has_spoken(activity, second_wait):
+    if await caller_has_spoken_since(
+        activity,
+        second_listen_started,
+        second_wait,
+    ):
+        LOGGER.info("Caller speech detected during second response window")
         return
 
     LOGGER.info(
@@ -1467,6 +1481,7 @@ async def openai_to_twilio(
             if delta.strip():
                 activity["caller_spoke"] = True
                 activity["caller_transcript_last"] = time.monotonic()
+                LOGGER.debug("Caller transcript activity detected during live call")
 
         elif event_type == "session.output_transcript.delta":
             transcripts["assistant"] += str(event.get("delta") or "")

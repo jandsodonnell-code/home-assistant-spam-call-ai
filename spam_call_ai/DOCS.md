@@ -3,9 +3,9 @@
 This Home Assistant app answers inbound Twilio calls and bridges the caller's
 audio to OpenAI GPT-Live.
 
-## Version 0.6.0
+## Version 0.7.0
 
-Version 0.6.0 adds automatic Google Contacts syncing. The app reads only the Google Contacts label configured in `google_contact_label` (default: `Trusted Callers`) using the People API `contacts.readonly` OAuth scope. Those phone numbers are merged with any manually configured trusted callers. Transfer is disabled by default. When enabled, GPT-Live may delegate a transfer decision to the Responses backend. The backend can request a transfer only when the caller explicitly asks to speak with the owner and the call appears clearly legitimate. The server independently enforces the confidence threshold before asking Twilio to redirect the active call to a <Dial> transfer.
+Version 0.7.0 treats trusted contacts as true safe callers. Safe callers are matched before any OpenAI media stream is opened. They are re-rung to the cell once, and if that second attempt is not answered, Twilio records a normal voicemail instead of sending the caller to AI. Transfer is disabled by default. When enabled, GPT-Live may delegate a transfer decision to the Responses backend. The backend can request a transfer only when the caller explicitly asks to speak with the owner and the call appears clearly legitimate. The server independently enforces the confidence threshold before asking Twilio to redirect the active call to a <Dial> transfer.
 
 No router port forwarding is required because the ngrok agent establishes the
 connection outbound from Home Assistant.
@@ -273,3 +273,35 @@ Successful sync fires:
 `spam_call_ai_google_contacts_synced`
 
 The event includes the label, contact count, and phone-number count.
+
+
+## Safe callers in 0.7.0
+
+Any number in the Google Contacts label configured by `google_contact_label`
+(default: `Trusted Callers`) or in the manual `trusted_callers` setting is safe.
+
+Safe-call flow:
+
+1. The normal cell rings first.
+2. Conditional forwarding sends an unanswered call to Twilio.
+3. The app checks the caller number against the safe list before creating any
+   OpenAI connection.
+4. Safe callers re-ring the cell once.
+5. If the second ring is unanswered, Twilio records a conventional voicemail.
+6. Safe callers never enter the AI screening stream.
+
+The app creates this Home Assistant entity:
+
+`sensor.spam_call_ai_safe_contacts`
+
+Its state is the number of safe phone numbers. Its attributes include the safe
+Google Contact names, the Google label, sync counts, last-sync timestamp, and
+sync error if one exists. This is intended for the dashboard card.
+
+The safe-call events are:
+
+- `spam_call_ai_safe_caller`
+- `spam_call_ai_safe_message_recorded`
+
+The safe voicemail maximum length is controlled by
+`safe_voicemail_max_seconds` and defaults to 120 seconds.

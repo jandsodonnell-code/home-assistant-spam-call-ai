@@ -16,6 +16,215 @@ LOGGER = logging.getLogger("spam_call_ai.safe")
 app = base.app
 SAFE_MESSAGE_PATH = Path("/data/last_safe_message.json")
 SAFE_CALL_PATH = Path("/data/last_safe_call.json")
+SCREEN_PROMPT_DIR = Path("/data/spam_call_ai_prompts")
+SCREEN_PROMPT_DIR.mkdir(parents=True, exist_ok=True)
+
+RETRY_PROMPT = "Hello? Are you there? Who's calling, and what are you calling about?"
+
+
+def _prompt_token(options: dict) -> str:
+    return base.media_token(options)
+
+
+def _prompt_url(options: dict, kind: str) -> str:
+    token = _prompt_token(options)
+    return f"{base.public_base_url(options)}/screen/prompt/{token}/{kind}.wav"
+
+
+async def _screen_prompt_wav(options: dict, kind: str) -> bytes:
+    if kind == "opening":
+        text = str(options.get("greeting") or "").strip()
+        if not text:
+            text = (
+                "Hi, you've reached the automated call assistant. "
+                "Who's calling, and what are you calling about?"
+            )
+    elif kind == "retry":
+        text = RETRY_PROMPT
+    else:
+        raise HTTPException(status_code=404, detail="Unknown prompt")
+
+    voice = str(options.get("voice") or "marin").strip()
+    cache_key = base.hashlib.sha256(
+        f"gpt-4o-mini-tts|{voice}|{text}".encode("utf-8")
+    ).hexdigest()[:20]
+    path = SCREEN_PROMPT_DIR / f"{kind}-{cache_key}.wav"
+
+    if path.exists() and path.stat().st_size > 44:
+        return path.read_bytes()
+
+    api_key = base.required_option(options, "openai_api_key")
+    headers = {
+        "Authorization": f"Bearer {api_key}",
+        "Content-Type": "application/json",
+    }
+    payload = {
+        "model": "gpt-4o-mini-tts",
+        "voice": voice,
+        "input": text,
+        "instructions": (
+            "Speak as a calm, friendly automated call screening assistant. "
+            "Use a natural phone cadence and clear diction."
+        ),
+        "response_format": "wav",
+    }
+
+    async with httpx.AsyncClient(timeout=60) as client:
+        response = await client.post(
+            "https://api.openai.com/v1/audio/speech",
+            headers=headers,
+            json=payload,
+        )
+        response.raise_for_status()
+        wav = response.content
+
+    path.write_bytes(wav)
+    LOGGER.info("Generated cached %s screening prompt with voice=%s", kind, voice)
+    return wav
+
+
+def _validate_twilio_action(
+    request: Request,
+    form_data: dict,
+    options: dict,
+) -> None:
+    if not base.validate_twilio_http_request(request, form_data, options):
+        raise HTTPException(status_code=403, detail="Invalid Twilio signature")
+
+    expected_account = base.required_option(options, "twilio_account_sid")
+    account_sid = str(form_data.get("AccountSid") or "")
+    if account_sid and account_sid != expected_account:
+        raise HTTPException(status_code=403, detail="Unexpected Twilio account")
+
+
+def _live_screen_twiml(
+    options: dict,
+    caller: str,
+    call_sid: str,
+    to_number: str,
+    initial_speech: str,
+) -> str:
+    return (
+        '<?xml version="1.0" encoding="UTF-8"?>'
+        "<Response>"
+        f"{base.ai_stream_xml(options, caller, call_sid, to_number, include_greeting=False, initial_speech=initial_speech)}"
+        "<Hangup/>"
+        "</Response>"
+    )
+
+
+def _first_screen_gather_twiml(options: dict) -> str:
+    action_url = base.public_base_url(options) + "/screen/first-result"
+    prompt_url = _prompt_url(options, "opening")
+    timeout = int(options.get("initial_response_timeout_seconds", 8))
+    return (
+        '<?xml version="1.0" encoding="UTF-8"?>'
+        "<Response>"
+        f'<Gather input="speech" timeout="{timeout}" speechTimeout="auto" '
+        f'actionOnEmptyResult="true" action={quoteattr(action_url)} method="POST">'
+        f"<Play>{escape(prompt_url)}</Play>"
+        "</Gather>"
+        "</Response>"
+    )
+
+
+def _second_screen_gather_twiml(options: dict) -> str:
+    action_url = base.public_base_url(options) + "/screen/second-result"
+    prompt_url = _prompt_url(options, "retry")
+    timeout = int(options.get("second_response_timeout_seconds", 7))
+    return (
+        '<?xml version="1.0" encoding="UTF-8"?>'
+        "<Response>"
+        f'<Gather input="speech" timeout="{timeout}" speechTimeout="auto" '
+        f'actionOnEmptyResult="true" action={quoteattr(action_url)} method="POST">'
+        f"<Play>{escape(prompt_url)}</Play>"
+        "</Gather>"
+        "</Response>"
+    )
+
+
+@app.get("/screen/prompt/{token}/{kind}.wav")
+async def screening_prompt_audio(token: str, kind: str) -> Response:
+    options = base.load_options()
+    if token != _prompt_token(options):
+        raise HTTPException(status_code=404, detail="Not found")
+    wav = await _screen_prompt_wav(options, kind)
+    return Response(
+        content=wav,
+        media_type="audio/wav",
+        headers={"Cache-Control": "public, max-age=86400"},
+    )
+
+
+@app.post("/screen/first-result")
+async def screen_first_result(request: Request) -> Response:
+    options = base.load_options()
+    form = await request.form()
+    form_data = dict(form)
+    _validate_twilio_action(request, form_data, options)
+
+    caller = str(form_data.get("From") or "unknown")
+    call_sid = str(form_data.get("CallSid") or "")
+    to_number = str(form_data.get("To") or "")
+    speech = str(form_data.get("SpeechResult") or "").strip()
+
+    if speech:
+        LOGGER.info("Initial screening speech captured; starting GPT-Live")
+        xml = _live_screen_twiml(
+            options, caller, call_sid, to_number, speech
+        )
+    else:
+        LOGGER.info(
+            "No speech after %ss opening window; playing one retry prompt",
+            int(options.get("initial_response_timeout_seconds", 8)),
+        )
+        xml = _second_screen_gather_twiml(options)
+
+    return Response(content=xml, media_type="application/xml")
+
+
+@app.post("/screen/second-result")
+async def screen_second_result(request: Request) -> Response:
+    options = base.load_options()
+    form = await request.form()
+    form_data = dict(form)
+    _validate_twilio_action(request, form_data, options)
+
+    caller = str(form_data.get("From") or "unknown")
+    call_sid = str(form_data.get("CallSid") or "")
+    to_number = str(form_data.get("To") or "")
+    speech = str(form_data.get("SpeechResult") or "").strip()
+
+    if speech:
+        LOGGER.info("Speech captured after retry prompt; starting GPT-Live")
+        xml = _live_screen_twiml(
+            options, caller, call_sid, to_number, speech
+        )
+    else:
+        LOGGER.info(
+            "No speech after retry prompt and %ss wait; ending call",
+            int(options.get("second_response_timeout_seconds", 7)),
+        )
+        xml = (
+            '<?xml version="1.0" encoding="UTF-8"?>'
+            "<Response><Hangup/></Response>"
+        )
+
+    return Response(content=xml, media_type="application/xml")
+
+
+@app.on_event("startup")
+async def warm_screening_prompts() -> None:
+    async def _warm() -> None:
+        try:
+            options = base.load_options()
+            await _screen_prompt_wav(options, "opening")
+            await _screen_prompt_wav(options, "retry")
+            LOGGER.info("Screening voice prompts ready")
+        except Exception as exc:
+            LOGGER.warning("Could not pre-generate screening prompts: %s", exc)
+
+    asyncio.create_task(_warm(), name="warm_screening_prompts")
 
 
 # Replace only the inbound Twilio route. Everything else remains in app.py.
@@ -643,12 +852,9 @@ async def twiml_v7(request: Request) -> Response:
 
         return Response(content=xml, media_type="application/xml")
 
-    # Only non-safe callers enter the AI screening flow.
-    xml = (
-        '<?xml version="1.0" encoding="UTF-8"?>'
-        "<Response>"
-        f"{base.ai_stream_xml(options, caller, call_sid, to_number, include_greeting=True)}"
-        "<Hangup/>"
-        "</Response>"
-    )
+    # Only non-safe callers enter the AI screening flow. Twilio <Gather>
+    # owns the two silence windows so the timing starts after each prompt
+    # finishes playing. The prompts are OpenAI TTS with the same configured
+    # voice used by GPT-Live.
+    xml = _first_screen_gather_twiml(options)
     return Response(content=xml, media_type="application/xml")

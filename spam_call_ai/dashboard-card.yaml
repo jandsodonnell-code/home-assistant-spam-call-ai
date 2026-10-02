@@ -1,0 +1,70 @@
+type: vertical-stack
+cards:
+  - type: markdown
+    content: |
+      ## 📞 Spam Call AI
+      {% if is_state('binary_sensor.spam_call_ai_online', 'on') %}
+      **Status:** 🟢 Online
+      {% else %}
+      **Status:** 🔴 Offline
+      {% endif %}
+
+      **Active calls:** {{ states('sensor.spam_call_ai_active_calls') }}
+      **Safe callers:** {{ states('sensor.spam_call_ai_safe_contacts') }}
+
+  - type: entities
+    title: Last Call
+    show_header_toggle: false
+    entities:
+      - entity: sensor.spam_call_ai_last_caller_name
+        name: Caller
+      - entity: sensor.spam_call_ai_last_caller
+        name: Number
+      - entity: sensor.spam_call_ai_last_call_type
+        name: Call Type
+      - entity: sensor.spam_call_ai_last_classification
+        name: Classification
+      - entity: sensor.spam_call_ai_last_spam_likelihood
+        name: Spam Likelihood
+      - entity: sensor.spam_call_ai_last_action
+        name: Action
+      - entity: sensor.spam_call_ai_last_duration
+        name: Duration
+
+  - type: markdown
+    title: Last Call Summary
+    content: |
+      {% set summary = states('sensor.spam_call_ai_last_summary') %}
+      {% if summary not in ['unknown', 'unavailable', 'No calls yet'] %}
+      {{ summary }}
+      {% else %}
+      No completed call information yet.
+      {% endif %}
+
+      {% set callback = states('sensor.spam_call_ai_last_callback_number') %}
+      {% if callback not in ['', 'unknown', 'unavailable', 'None'] %}
+      **Callback:** {{ callback }}
+      {% endif %}
+
+  - type: markdown
+    title: Safe Callers
+    content: |
+      {% set contacts = state_attr('sensor.spam_call_ai_safe_contacts', 'contacts') or [] %}
+      {% if contacts %}
+      {% for contact in contacts %}
+      ✅ {{ contact }}
+      {% endfor %}
+      {% else %}
+      No safe contacts are currently listed.
+      {% endif %}
+
+      **Policy:** Safe callers bypass AI completely.
+
+  - type: entities
+    title: Google Contacts
+    show_header_toggle: false
+    entities:
+      - entity: sensor.spam_call_ai_google_sync_status
+        name: Sync Status
+      - entity: sensor.spam_call_ai_google_last_sync
+        name: Last Sync

@@ -465,3 +465,15 @@ For a non-safe caller:
 
 The prompt WAV files are cached under `/data/spam_call_ai_prompts` and warmed
 at app startup. Safe callers still bypass AI completely.
+
+
+## Second-silence hangup fallback in 0.8.8
+
+The second screening prompt now uses Twilio's normal empty-Gather fall-through
+behavior instead of relying on `actionOnEmptyResult`. If the caller speaks,
+Twilio posts the speech result to `/screen/second-result` and GPT-Live starts.
+If the caller says nothing for the configured 7-second timeout, Twilio falls
+through directly to a literal `<Hangup/>` in the same TwiML response.
+
+This gives the second silence window a local fail-safe: even if no empty-result
+webhook is sent, the call still ends.

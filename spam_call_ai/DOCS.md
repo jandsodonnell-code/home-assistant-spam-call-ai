@@ -362,3 +362,22 @@ Create four Toggle helpers with these entity IDs:
 
 The top row of dashboard buttons toggles each section. The implementation uses
 only built-in Button and Conditional cards; HACS is not required.
+
+
+## Matching greeting voice and silent-caller retry in 0.8.2
+
+The initial screening greeting is now spoken by the same GPT-Live session that
+handles the rest of the conversation. This means the configured `voice`
+(default `marin`) is used for both the opening message and the live conversation.
+Twilio `<Say>` is no longer used for the AI-screened opening greeting.
+
+If an AI-screened caller says nothing after the opening greeting:
+
+1. The app waits `initial_response_timeout_seconds` (default 8 seconds).
+2. GPT-Live asks once more: "Hello? Are you there? Who's calling, and what are
+   you calling about?"
+3. The app waits `second_response_timeout_seconds` (default 7 seconds).
+4. If no caller speech is transcribed, the GPT-Live session is closed and the
+   call ends.
+
+Safe callers are unchanged and still bypass OpenAI completely.

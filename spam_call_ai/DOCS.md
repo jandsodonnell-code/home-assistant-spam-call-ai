@@ -428,3 +428,19 @@ during the greeting could permanently suppress the 8-second retry.
 Version 0.8.5 starts a fresh response window only after Twilio confirms each
 prompt has finished playing. Only caller transcript activity arriving inside
 that response window counts as a response.
+
+
+## Silence monitor generation fix in 0.8.6
+
+A test call showed that the call and GPT-Live stream were healthy, but the
+silence monitor never reached its "starting 8s silence timer" log line.
+
+GPT-Live does not provide a per-utterance audio-done event. Version 0.8.6 no
+longer waits for output audio packets to stop arriving. It watches the assistant
+output transcript timeline and the output-audio timeline together. Once the
+assistant transcript is briefly quiet and audio generation has caught up, the
+app sends a Twilio playback mark. The 8-second timer begins only after Twilio
+acknowledges that mark.
+
+The app now also logs its code version and each silence-monitor stage so a call
+log can show exactly where a future failure occurs.

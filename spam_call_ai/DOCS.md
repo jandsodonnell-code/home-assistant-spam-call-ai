@@ -416,3 +416,15 @@ Useful log lines during a silent-call test are:
 - `Caller remained silent for 8s after opening greeting; asking one more time`
 - `Second prompt playback complete; starting 7s silence timer`
 - `Caller remained silent for 7s after second prompt; ending call`
+
+
+## Silence retry correction in 0.8.5
+
+The silence monitor no longer treats any caller transcript captured earlier in
+the call as proof that the caller responded to the greeting. The prior logic
+used one persistent `caller_spoke` flag, so noise or a stray transcription
+during the greeting could permanently suppress the 8-second retry.
+
+Version 0.8.5 starts a fresh response window only after Twilio confirms each
+prompt has finished playing. Only caller transcript activity arriving inside
+that response window counts as a response.

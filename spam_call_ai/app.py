@@ -35,7 +35,7 @@ GOOGLE_CONTACTS_PATH = Path("/data/google_trusted_contacts.json")
 GOOGLE_SCOPE = "https://www.googleapis.com/auth/contacts.readonly"
 OPENAI_LIVE_URL = "wss://api.openai.com/v1/live/sessions"
 
-APP_VERSION = "0.8.7"
+APP_VERSION = "0.8.8"
 app = FastAPI(title="Spam Call AI", version=APP_VERSION)
 active_calls: dict[str, dict[str, Any]] = {}
 

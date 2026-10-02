@@ -342,3 +342,23 @@ A complete built-in Home Assistant card is included at:
 `spam_call_ai/dashboard-card.yaml`
 
 It uses only built-in Markdown and Entities cards and does not require HACS.
+
+
+## Collapsible dashboard sections in 0.8.1
+
+The dashboard card can now hide or show these four sections independently:
+
+- Last Call
+- Last Call Summary
+- Safe Callers
+- Google Contacts
+
+Create four Toggle helpers with these entity IDs:
+
+- `input_boolean.spam_call_ai_show_last_call`
+- `input_boolean.spam_call_ai_show_summary`
+- `input_boolean.spam_call_ai_show_safe_callers`
+- `input_boolean.spam_call_ai_show_google_contacts`
+
+The top row of dashboard buttons toggles each section. The implementation uses
+only built-in Button and Conditional cards; HACS is not required.

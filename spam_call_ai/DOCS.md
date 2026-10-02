@@ -381,3 +381,20 @@ If an AI-screened caller says nothing after the opening greeting:
    call ends.
 
 Safe callers are unchanged and still bypass OpenAI completely.
+
+
+## Harmless spam time-waster mode in 0.8.3
+
+For AI-screened callers, GPT-Live now shifts into a harmless time-waster style
+when the live conversation gives strong reason to believe the caller is spam,
+scam, robocall, or unsolicited sales.
+
+The assistant keeps the caller talking with short clarification questions,
+repetition requests, and harmless requests for company/department/reference
+details. It never supplies useful personal information, account information,
+payments, verification codes, device access, links, downloads, or other help to
+the caller. It does not tell the caller that it is intentionally occupying their
+time, and it returns to normal concise screening if the caller appears legitimate.
+
+The final post-call classification still occurs after the call. The live model
+uses the conversation itself to decide when to adopt the time-waster style.

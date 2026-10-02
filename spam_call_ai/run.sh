@@ -3,7 +3,7 @@ set -e
 
 bashio::log.info "Starting Spam Call AI"
 
-/opt/venv/bin/uvicorn app:app \
+/opt/venv/bin/uvicorn safe_routes:app \
   --host 0.0.0.0 \
   --port 8000 \
   --proxy-headers \

@@ -36,7 +36,7 @@ def _safe_contact_names(options: dict) -> list[str]:
     manual = str(options.get("trusted_callers") or "").strip()
     if manual:
         manual_count = 0
-        for token in base.re.split(r"[,;\\s]+", manual):
+        for token in base.re.split(r"[,;\s]+", manual):
             if base.normalize_phone_number(token):
                 manual_count += 1
         if manual_count:

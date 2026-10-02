@@ -398,3 +398,21 @@ time, and it returns to normal concise screening if the caller appears legitimat
 
 The final post-call classification still occurs after the call. The live model
 uses the conversation itself to decide when to adopt the time-waster style.
+
+
+## Precise silence timing in 0.8.4
+
+The 8-second and 7-second silence timers now start only after Twilio confirms that
+the corresponding spoken prompt has actually finished playing to the caller.
+
+The app sends Twilio Media Streams `mark` messages after the GPT-Live greeting
+and retry prompt, then waits for the matching Twilio playback acknowledgement.
+This avoids starting the silence timer while generated audio is still buffered
+for playback.
+
+Useful log lines during a silent-call test are:
+
+- `Opening greeting playback complete; starting 8s silence timer`
+- `Caller remained silent for 8s after opening greeting; asking one more time`
+- `Second prompt playback complete; starting 7s silence timer`
+- `Caller remained silent for 7s after second prompt; ending call`

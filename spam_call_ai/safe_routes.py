@@ -136,9 +136,10 @@ def _second_screen_gather_twiml(options: dict) -> str:
         '<?xml version="1.0" encoding="UTF-8"?>'
         "<Response>"
         f'<Gather input="speech" timeout="{timeout}" speechTimeout="auto" '
-        f'actionOnEmptyResult="true" action={quoteattr(action_url)} method="POST">'
+        f'action={quoteattr(action_url)} method="POST">'
         f"<Play>{escape(prompt_url)}</Play>"
         "</Gather>"
+        "<Hangup/>"
         "</Response>"
     )
 

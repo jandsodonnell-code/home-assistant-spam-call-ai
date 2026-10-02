@@ -35,7 +35,7 @@ GOOGLE_CONTACTS_PATH = Path("/data/google_trusted_contacts.json")
 GOOGLE_SCOPE = "https://www.googleapis.com/auth/contacts.readonly"
 OPENAI_LIVE_URL = "wss://api.openai.com/v1/live/sessions"
 
-app = FastAPI(title="Spam Call AI", version="0.8.3")
+app = FastAPI(title="Spam Call AI", version="0.8.4")
 active_calls: dict[str, dict[str, Any]] = {}
 
 
@@ -1237,7 +1237,7 @@ async def wait_for_assistant_audio_to_settle(
     activity: dict[str, Any],
     baseline: float = 0.0,
     start_timeout: float = 12.0,
-    quiet_seconds: float = 1.1,
+    quiet_seconds: float = 1.5,
 ) -> bool:
     deadline = time.monotonic() + start_timeout
 
@@ -1257,6 +1257,31 @@ async def wait_for_assistant_audio_to_settle(
     return False
 
 
+async def wait_for_twilio_playback(
+    twilio_ws: WebSocket,
+    stream_sid: str,
+    activity: dict[str, Any],
+    mark_name: str,
+    timeout_seconds: float = 12.0,
+) -> bool:
+    marks = activity.setdefault("twilio_marks_seen", set())
+    await twilio_ws.send_json(
+        {
+            "event": "mark",
+            "streamSid": stream_sid,
+            "mark": {"name": mark_name},
+        }
+    )
+
+    deadline = time.monotonic() + timeout_seconds
+    while time.monotonic() < deadline:
+        if mark_name in marks:
+            return True
+        await asyncio.sleep(0.1)
+
+    return False
+
+
 async def caller_has_spoken(
     activity: dict[str, Any],
     timeout_seconds: float,
@@ -1271,6 +1296,8 @@ async def caller_has_spoken(
 
 async def initial_silence_monitor(
     openai_ws,
+    twilio_ws: WebSocket,
+    stream_sid: str,
     activity: dict[str, Any],
     options: dict[str, Any],
 ) -> None:
@@ -1301,11 +1328,29 @@ async def initial_silence_monitor(
         LOGGER.warning("Opening greeting audio was not detected; silence retry monitor stopped")
         return
 
+    if bool(activity.get("caller_spoke")):
+        return
+
+    greeting_played = await wait_for_twilio_playback(
+        twilio_ws,
+        stream_sid,
+        activity,
+        "opening_greeting_played",
+    )
+    if not greeting_played:
+        LOGGER.warning("Twilio did not confirm opening greeting playback; silence retry monitor stopped")
+        return
+
+    LOGGER.info(
+        "Opening greeting playback complete; starting %ss silence timer",
+        initial_wait,
+    )
     if await caller_has_spoken(activity, initial_wait):
         return
 
     LOGGER.info(
-        "Caller remained silent after opening greeting; asking one more time"
+        "Caller remained silent for %ss after opening greeting; asking one more time",
+        initial_wait,
     )
     baseline = float(activity.get("assistant_audio_last") or 0.0)
     await send_live_instruction(
@@ -1326,17 +1371,41 @@ async def initial_silence_monitor(
         LOGGER.warning("Second silence prompt audio was not detected; leaving call open")
         return
 
+    if bool(activity.get("caller_spoke")):
+        return
+
+    retry_played = await wait_for_twilio_playback(
+        twilio_ws,
+        stream_sid,
+        activity,
+        "silence_retry_played",
+    )
+    if not retry_played:
+        LOGGER.warning("Twilio did not confirm second prompt playback; leaving call open")
+        return
+
+    LOGGER.info(
+        "Second prompt playback complete; starting %ss silence timer",
+        second_wait,
+    )
     if await caller_has_spoken(activity, second_wait):
         return
 
-    LOGGER.info("Caller remained silent after second prompt; ending call")
+    LOGGER.info(
+        "Caller remained silent for %ss after second prompt; ending call",
+        second_wait,
+    )
     try:
         await openai_ws.send(json.dumps({"type": "session.close"}))
     except Exception as exc:
         LOGGER.warning("Could not close silent GPT-Live session: %s", exc)
 
 
-async def twilio_to_openai(twilio_ws: WebSocket, openai_ws) -> None:
+async def twilio_to_openai(
+    twilio_ws: WebSocket,
+    openai_ws,
+    activity: dict[str, Any],
+) -> None:
     while True:
         try:
             message = await twilio_ws.receive_text()
@@ -1357,6 +1426,11 @@ async def twilio_to_openai(twilio_ws: WebSocket, openai_ws) -> None:
                         }
                     )
                 )
+        elif event == "mark":
+            mark_name = str((data.get("mark") or {}).get("name") or "")
+            if mark_name:
+                activity.setdefault("twilio_marks_seen", set()).add(mark_name)
+                LOGGER.info("Twilio playback mark received: %s", mark_name)
         elif event == "stop":
             return
 
@@ -1467,6 +1541,7 @@ async def media(websocket: WebSocket, token: str) -> None:
         "caller_spoke": False,
         "caller_transcript_last": 0.0,
         "assistant_audio_last": 0.0,
+        "twilio_marks_seen": set(),
     }
 
     try:
@@ -1615,7 +1690,7 @@ async def media(websocket: WebSocket, token: str) -> None:
             await wait_for_openai_session_started(openai_ws)
 
             inbound = asyncio.create_task(
-                twilio_to_openai(websocket, openai_ws),
+                twilio_to_openai(websocket, openai_ws, activity),
                 name="twilio_to_openai",
             )
             outbound = asyncio.create_task(
@@ -1634,6 +1709,8 @@ async def media(websocket: WebSocket, token: str) -> None:
             silence_monitor = asyncio.create_task(
                 initial_silence_monitor(
                     openai_ws,
+                    websocket,
+                    stream_sid,
                     activity,
                     options,
                 ),

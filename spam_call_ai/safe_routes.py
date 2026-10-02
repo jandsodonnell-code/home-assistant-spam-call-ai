@@ -3,6 +3,7 @@ import logging
 import os
 import time
 from pathlib import Path
+from datetime import datetime, timezone
 from xml.sax.saxutils import escape, quoteattr
 
 import httpx
@@ -14,6 +15,7 @@ import app as base
 LOGGER = logging.getLogger("spam_call_ai.safe")
 app = base.app
 SAFE_MESSAGE_PATH = Path("/data/last_safe_message.json")
+SAFE_CALL_PATH = Path("/data/last_safe_call.json")
 
 
 # Replace only the inbound Twilio route. Everything else remains in app.py.
@@ -35,14 +37,307 @@ def _safe_contact_names(options: dict) -> list[str]:
 
     manual = str(options.get("trusted_callers") or "").strip()
     if manual:
-        manual_count = 0
         for token in base.re.split(r"[,;\s]+", manual):
-            if base.normalize_phone_number(token):
-                manual_count += 1
-        if manual_count:
-            names.append(f"{manual_count} manual safe number(s)")
+            number = base.normalize_phone_number(token)
+            if number:
+                label = f"Manual: {number}"
+                if label not in names:
+                    names.append(label)
 
     return sorted(names, key=str.casefold)
+
+
+def _iso_utc(value) -> str:
+    try:
+        stamp = float(value or 0)
+    except (TypeError, ValueError):
+        stamp = 0
+    if stamp <= 0:
+        return "Never"
+    return datetime.fromtimestamp(stamp, tz=timezone.utc).isoformat()
+
+
+def _state_text(value, fallback: str = "Unknown") -> str:
+    text = str(value or "").strip()
+    return text if text else fallback
+
+
+def _last_dashboard_activity() -> dict:
+    ai_call = base.load_json_file(base.LAST_CALL_PATH)
+    safe_call = base.load_json_file(SAFE_CALL_PATH)
+
+    try:
+        ai_time = float(ai_call.get("ended_at_unix") or 0)
+    except (TypeError, ValueError):
+        ai_time = 0
+    try:
+        safe_time = float(safe_call.get("updated_at_unix") or 0)
+    except (TypeError, ValueError):
+        safe_time = 0
+
+    if safe_time >= ai_time and safe_time > 0:
+        status = str(safe_call.get("status") or "safe").replace("_", " ").title()
+        summary = str(
+            safe_call.get("summary")
+            or "Safe caller bypassed AI."
+        ).strip()
+        return {
+            "caller": str(safe_call.get("caller") or "Unknown"),
+            "caller_name": str(safe_call.get("trusted_name") or "Safe caller"),
+            "call_type": "Safe caller",
+            "classification": "Safe",
+            "spam_likelihood_percent": 0,
+            "summary": summary,
+            "callback_number": "",
+            "duration_seconds": safe_call.get("duration_seconds") or 0,
+            "action": status,
+            "time_unix": safe_time,
+            "ai_used": False,
+            "status": status,
+        }
+
+    if ai_time > 0:
+        analysis = ai_call.get("analysis") or {}
+        try:
+            spam_percent = round(float(analysis.get("spam_likelihood") or 0) * 100)
+        except (TypeError, ValueError):
+            spam_percent = 0
+        classification = _state_text(
+            analysis.get("classification"),
+            "Unknown",
+        ).title()
+        return {
+            "caller": str(ai_call.get("caller") or "Unknown"),
+            "caller_name": _state_text(analysis.get("caller_name"), "Unknown"),
+            "call_type": "AI screened",
+            "classification": classification,
+            "spam_likelihood_percent": spam_percent,
+            "summary": _state_text(
+                analysis.get("summary"),
+                "AI-screened call completed.",
+            ),
+            "callback_number": str(analysis.get("callback_number") or ""),
+            "duration_seconds": ai_call.get("duration_seconds") or 0,
+            "action": _state_text(
+                analysis.get("recommended_action"),
+                "Review",
+            ).title(),
+            "time_unix": ai_time,
+            "ai_used": True,
+            "status": "Completed",
+        }
+
+    return {
+        "caller": "No calls yet",
+        "caller_name": "No calls yet",
+        "call_type": "No calls yet",
+        "classification": "No calls yet",
+        "spam_likelihood_percent": "unknown",
+        "summary": "No calls yet",
+        "callback_number": "",
+        "duration_seconds": "unknown",
+        "action": "No calls yet",
+        "time_unix": 0,
+        "ai_used": False,
+        "status": "No calls yet",
+    }
+
+
+async def _write_ha_states(states: list[tuple[str, object, dict]]) -> None:
+    token = os.environ.get("SUPERVISOR_TOKEN")
+    if not token:
+        LOGGER.error("Dashboard entities: SUPERVISOR_TOKEN is unavailable")
+        return
+
+    headers = {
+        "Authorization": f"Bearer {token}",
+        "Content-Type": "application/json",
+    }
+    async with httpx.AsyncClient(timeout=10) as client:
+        for entity_id, state, attributes in states:
+            response = await client.post(
+                f"http://supervisor/core/api/states/{entity_id}",
+                headers=headers,
+                json={
+                    "state": str(state),
+                    "attributes": attributes,
+                },
+            )
+            response.raise_for_status()
+
+
+async def _publish_dashboard_entities() -> None:
+    activity = _last_dashboard_activity()
+    google = base.google_contacts_status()
+    last_sync = _iso_utc(google.get("last_sync_unix"))
+
+    if google.get("last_error"):
+        google_status = "Error"
+    elif google.get("last_sync_unix"):
+        google_status = "Synced"
+    elif google.get("authorized"):
+        google_status = "Authorized"
+    else:
+        google_status = "Not authorized"
+
+    summary_state = str(activity["summary"])[:250]
+    callback_state = str(activity["callback_number"] or "None")
+
+    common_last_call_attrs = {
+        "friendly_name": "Spam Call AI Last Call",
+        "icon": "mdi:phone-log",
+        "caller": activity["caller"],
+        "caller_name": activity["caller_name"],
+        "call_type": activity["call_type"],
+        "classification": activity["classification"],
+        "spam_likelihood_percent": activity["spam_likelihood_percent"],
+        "summary": activity["summary"],
+        "callback_number": activity["callback_number"],
+        "duration_seconds": activity["duration_seconds"],
+        "action": activity["action"],
+        "status": activity["status"],
+        "time": _iso_utc(activity["time_unix"]),
+        "ai_used": activity["ai_used"],
+    }
+
+    states = [
+        (
+            "binary_sensor.spam_call_ai_online",
+            "on",
+            {
+                "friendly_name": "Spam Call AI Online",
+                "icon": "mdi:phone-check",
+            },
+        ),
+        (
+            "sensor.spam_call_ai_active_calls",
+            len(base.active_calls),
+            {
+                "friendly_name": "Spam Call AI Active Calls",
+                "icon": "mdi:phone-in-talk",
+            },
+        ),
+        (
+            "sensor.spam_call_ai_last_call",
+            activity["classification"],
+            common_last_call_attrs,
+        ),
+        (
+            "sensor.spam_call_ai_last_caller",
+            activity["caller"],
+            {
+                "friendly_name": "Spam Call AI Last Caller",
+                "icon": "mdi:phone",
+            },
+        ),
+        (
+            "sensor.spam_call_ai_last_caller_name",
+            activity["caller_name"],
+            {
+                "friendly_name": "Spam Call AI Last Caller Name",
+                "icon": "mdi:account",
+            },
+        ),
+        (
+            "sensor.spam_call_ai_last_call_type",
+            activity["call_type"],
+            {
+                "friendly_name": "Spam Call AI Last Call Type",
+                "icon": "mdi:shield-phone",
+            },
+        ),
+        (
+            "sensor.spam_call_ai_last_classification",
+            activity["classification"],
+            {
+                "friendly_name": "Spam Call AI Last Classification",
+                "icon": "mdi:shield-search",
+            },
+        ),
+        (
+            "sensor.spam_call_ai_last_spam_likelihood",
+            activity["spam_likelihood_percent"],
+            {
+                "friendly_name": "Spam Call AI Last Spam Likelihood",
+                "icon": "mdi:percent",
+                "unit_of_measurement": "%",
+            },
+        ),
+        (
+            "sensor.spam_call_ai_last_action",
+            activity["action"],
+            {
+                "friendly_name": "Spam Call AI Last Action",
+                "icon": "mdi:phone-check-outline",
+            },
+        ),
+        (
+            "sensor.spam_call_ai_last_duration",
+            activity["duration_seconds"],
+            {
+                "friendly_name": "Spam Call AI Last Duration",
+                "icon": "mdi:timer-outline",
+                "unit_of_measurement": "s",
+            },
+        ),
+        (
+            "sensor.spam_call_ai_last_summary",
+            summary_state,
+            {
+                "friendly_name": "Spam Call AI Last Summary",
+                "icon": "mdi:text-box-outline",
+                "full_summary": activity["summary"],
+            },
+        ),
+        (
+            "sensor.spam_call_ai_last_callback_number",
+            callback_state,
+            {
+                "friendly_name": "Spam Call AI Last Callback Number",
+                "icon": "mdi:phone-return",
+            },
+        ),
+        (
+            "sensor.spam_call_ai_last_call_time",
+            _iso_utc(activity["time_unix"]),
+            {
+                "friendly_name": "Spam Call AI Last Call Time",
+                "icon": "mdi:clock-outline",
+            },
+        ),
+        (
+            "sensor.spam_call_ai_google_sync_status",
+            google_status,
+            {
+                "friendly_name": "Spam Call AI Google Sync Status",
+                "icon": "mdi:contacts",
+                "last_error": google.get("last_error"),
+            },
+        ),
+        (
+            "sensor.spam_call_ai_google_last_sync",
+            last_sync,
+            {
+                "friendly_name": "Spam Call AI Google Last Sync",
+                "icon": "mdi:sync",
+            },
+        ),
+    ]
+
+    await _write_ha_states(states)
+
+
+async def _dashboard_entities_loop() -> None:
+    LOGGER.info("Spam Call AI dashboard entity publisher started")
+    await asyncio.sleep(6)
+    while True:
+        try:
+            await _publish_dashboard_entities()
+        except asyncio.CancelledError:
+            return
+        except Exception as exc:
+            LOGGER.warning("Dashboard entity update failed: %s", exc)
+        await asyncio.sleep(10)
 
 
 async def _publish_safe_contacts_sensor() -> None:
@@ -115,6 +410,14 @@ async def _start_safe_contacts_sensor() -> None:
     )
 
 
+@app.on_event("startup")
+async def _start_dashboard_entities() -> None:
+    asyncio.create_task(
+        _dashboard_entities_loop(),
+        name="spam_call_ai_dashboard_entities",
+    )
+
+
 def _safe_voicemail_twiml(options: dict) -> str:
     max_seconds = int(options.get("safe_voicemail_max_seconds", 120))
     action_url = base.public_base_url(options) + "/trusted/voicemail"
@@ -142,14 +445,35 @@ async def trusted_dial_result(request: Request) -> Response:
     except (TypeError, ValueError):
         duration = 0
 
+    caller = str(form_data.get("From") or "unknown")
+    call_sid = str(form_data.get("CallSid") or "")
+    safe_state = base.load_json_file(SAFE_CALL_PATH)
+    safe_state.update(
+        {
+            "caller": caller,
+            "trusted_name": base.google_synced_name_for_number(caller)
+            or str(safe_state.get("trusted_name") or ""),
+            "call_sid": call_sid,
+            "duration_seconds": duration,
+            "updated_at_unix": time.time(),
+            "ai_used": False,
+        }
+    )
+
     # A normal answered conversation should simply end. Very short "completed"
     # legs are treated like an unanswered forwarding loop and go to voicemail.
     if status == "completed" and duration > 3:
+        safe_state["status"] = "answered"
+        safe_state["summary"] = "Safe caller connected to your phone. AI was not used."
+        base.save_json_file(SAFE_CALL_PATH, safe_state)
         xml = (
             '<?xml version="1.0" encoding="UTF-8"?>'
             "<Response><Hangup/></Response>"
         )
     else:
+        safe_state["status"] = "voicemail"
+        safe_state["summary"] = "Safe caller was not answered and was sent to voicemail. AI was not used."
+        base.save_json_file(SAFE_CALL_PATH, safe_state)
         xml = (
             '<?xml version="1.0" encoding="UTF-8"?>'
             "<Response>"
@@ -185,6 +509,24 @@ async def trusted_voicemail(request: Request) -> Response:
         "ai_used": False,
     }
     base.save_json_file(SAFE_MESSAGE_PATH, data)
+
+    safe_state = base.load_json_file(SAFE_CALL_PATH)
+    safe_state.update(
+        {
+            "caller": caller,
+            "trusted_name": trusted_name
+            or str(safe_state.get("trusted_name") or ""),
+            "call_sid": data["call_sid"],
+            "status": "voicemail_recorded",
+            "duration_seconds": data["recording_duration_seconds"] or 0,
+            "summary": "Safe caller left a voicemail. AI was not used.",
+            "recording_sid": data["recording_sid"],
+            "recording_url": data["recording_url"],
+            "updated_at_unix": time.time(),
+            "ai_used": False,
+        }
+    )
+    base.save_json_file(SAFE_CALL_PATH, safe_state)
 
     LOGGER.info(
         "Safe caller message recorded: caller=%s name=%s duration=%ss",
@@ -258,6 +600,22 @@ async def twiml_v7(request: Request) -> Response:
 
         destination = str(options.get("forward_to_number") or "").strip()
         rering_enabled = bool(options.get("trusted_rering_enabled", True))
+
+        safe_state = {
+            "caller": caller,
+            "trusted_name": trusted_name,
+            "call_sid": call_sid,
+            "status": "re_ringing" if rering_enabled and destination else "voicemail",
+            "duration_seconds": 0,
+            "summary": (
+                "Safe caller bypassed AI and is being re-rung to your phone."
+                if rering_enabled and destination
+                else "Safe caller bypassed AI and was sent to voicemail."
+            ),
+            "updated_at_unix": time.time(),
+            "ai_used": False,
+        }
+        base.save_json_file(SAFE_CALL_PATH, safe_state)
 
         if rering_enabled and destination:
             timeout = int(options.get("trusted_rering_timeout_seconds", 15))

@@ -35,7 +35,7 @@ GOOGLE_CONTACTS_PATH = Path("/data/google_trusted_contacts.json")
 GOOGLE_SCOPE = "https://www.googleapis.com/auth/contacts.readonly"
 OPENAI_LIVE_URL = "wss://api.openai.com/v1/live/sessions"
 
-app = FastAPI(title="Spam Call AI", version="0.6.0")
+app = FastAPI(title="Spam Call AI", version="0.8.2")
 active_calls: dict[str, dict[str, Any]] = {}
 
 
@@ -525,7 +525,6 @@ def ai_stream_xml(
     to_number: str,
     include_greeting: bool = True,
 ) -> str:
-    greeting = str(options.get("greeting") or "").strip()
     stream_url = media_ws_url(options)
 
     parameter_xml = (
@@ -533,13 +532,10 @@ def ai_stream_xml(
         f'<Parameter name="callSid" value={quoteattr(call_sid)} />'
         f'<Parameter name="to" value={quoteattr(to_number)} />'
     )
-    say_xml = (
-        f"<Say>{escape(greeting)}</Say>"
-        if include_greeting and greeting
-        else ""
-    )
+
+    # The greeting is spoken inside the GPT-Live session instead of Twilio <Say>.
+    # That keeps the opening screening message and conversation on the same voice.
     return (
-        f"{say_xml}"
         "<Connect>"
         f"<Stream url={quoteattr(stream_url)}>{parameter_xml}</Stream>"
         "</Connect>"
@@ -597,8 +593,12 @@ never promise an immediate transfer.
     return f"""
 You are an automated telephone screening assistant for an inbound phone number.
 
-The caller has already heard: "Hi, you've reached the automated call assistant.
-Who's calling, and what are you calling about?"
+At the beginning of the call, the application will instruct you to speak the
+configured opening greeting. Use the same voice and speaking style for the
+opening greeting and the rest of the conversation.
+
+If the caller does not speak, remain quiet and wait for the application's
+silence-handling instruction. Do not invent a caller response.
 
 Your role is to protect the phone owner from spam, scams, telemarketing, and
 unwanted solicitation while remaining courteous to legitimate callers.
@@ -1199,6 +1199,122 @@ async def wait_for_openai_session_started(openai_ws) -> None:
             raise RuntimeError(f"OpenAI session error: {event}")
 
 
+async def send_live_instruction(openai_ws, content: str, event_id: str) -> None:
+    await openai_ws.send(
+        json.dumps(
+            {
+                "type": "session.instructions.append",
+                "event_id": event_id,
+                "delegation_id": None,
+                "content": content,
+            }
+        )
+    )
+
+
+async def wait_for_assistant_audio_to_settle(
+    activity: dict[str, Any],
+    baseline: float = 0.0,
+    start_timeout: float = 12.0,
+    quiet_seconds: float = 1.1,
+) -> bool:
+    deadline = time.monotonic() + start_timeout
+
+    while time.monotonic() < deadline:
+        last_audio = float(activity.get("assistant_audio_last") or 0.0)
+        if last_audio > baseline:
+            while True:
+                await asyncio.sleep(0.15)
+                newest = float(activity.get("assistant_audio_last") or 0.0)
+                if newest > last_audio:
+                    last_audio = newest
+                    continue
+                if time.monotonic() - newest >= quiet_seconds:
+                    return True
+        await asyncio.sleep(0.1)
+
+    return False
+
+
+async def caller_has_spoken(
+    activity: dict[str, Any],
+    timeout_seconds: float,
+) -> bool:
+    deadline = time.monotonic() + timeout_seconds
+    while time.monotonic() < deadline:
+        if bool(activity.get("caller_spoke")):
+            return True
+        await asyncio.sleep(0.15)
+    return bool(activity.get("caller_spoke"))
+
+
+async def initial_silence_monitor(
+    openai_ws,
+    activity: dict[str, Any],
+    options: dict[str, Any],
+) -> None:
+    greeting = str(options.get("greeting") or "").strip()
+    if not greeting:
+        greeting = (
+            "Hi, you've reached the automated call assistant. "
+            "Who's calling, and what are you calling about?"
+        )
+
+    initial_wait = int(options.get("initial_response_timeout_seconds", 8))
+    second_wait = int(options.get("second_response_timeout_seconds", 7))
+
+    # Open with GPT-Live itself so the greeting voice is identical to the
+    # conversational voice configured for this session.
+    await send_live_instruction(
+        openai_ws,
+        (
+            "Greet the caller now in English. Say the following opening greeting "
+            "naturally and without adding anything else: "
+            f"{greeting} Then pause and listen."
+        ),
+        "opening_greeting",
+    )
+
+    greeting_finished = await wait_for_assistant_audio_to_settle(activity)
+    if not greeting_finished:
+        LOGGER.warning("Opening greeting audio was not detected; silence retry monitor stopped")
+        return
+
+    if await caller_has_spoken(activity, initial_wait):
+        return
+
+    LOGGER.info(
+        "Caller remained silent after opening greeting; asking one more time"
+    )
+    baseline = float(activity.get("assistant_audio_last") or 0.0)
+    await send_live_instruction(
+        openai_ws,
+        (
+            "The caller has not spoken. Ask once more, briefly and naturally: "
+            "'Hello? Are you there? Who's calling, and what are you calling about?' "
+            "Then pause and listen. Do not add anything else unless the caller responds."
+        ),
+        "silence_retry",
+    )
+
+    retry_finished = await wait_for_assistant_audio_to_settle(
+        activity,
+        baseline=baseline,
+    )
+    if not retry_finished:
+        LOGGER.warning("Second silence prompt audio was not detected; leaving call open")
+        return
+
+    if await caller_has_spoken(activity, second_wait):
+        return
+
+    LOGGER.info("Caller remained silent after second prompt; ending call")
+    try:
+        await openai_ws.send(json.dumps({"type": "session.close"}))
+    except Exception as exc:
+        LOGGER.warning("Could not close silent GPT-Live session: %s", exc)
+
+
 async def twilio_to_openai(twilio_ws: WebSocket, openai_ws) -> None:
     while True:
         try:
@@ -1232,6 +1348,7 @@ async def openai_to_twilio(
     options: dict[str, Any],
     call_sid: str,
     caller: str,
+    activity: dict[str, Any],
 ) -> None:
     async for raw in openai_ws:
         event = json.loads(raw)
@@ -1240,6 +1357,7 @@ async def openai_to_twilio(
         if event_type == "session.output_audio.delta":
             delta = event.get("delta")
             if delta:
+                activity["assistant_audio_last"] = time.monotonic()
                 await twilio_ws.send_json(
                     {
                         "event": "media",
@@ -1249,7 +1367,11 @@ async def openai_to_twilio(
                 )
 
         elif event_type == "session.input_transcript.delta":
-            transcripts["caller"] += str(event.get("delta") or "")
+            delta = str(event.get("delta") or "")
+            transcripts["caller"] += delta
+            if delta.strip():
+                activity["caller_spoke"] = True
+                activity["caller_transcript_last"] = time.monotonic()
 
         elif event_type == "session.output_transcript.delta":
             transcripts["assistant"] += str(event.get("delta") or "")
@@ -1320,6 +1442,11 @@ async def media(websocket: WebSocket, token: str) -> None:
     call_sid = ""
     start_time = time.monotonic()
     transcripts = {"caller": "", "assistant": ""}
+    activity: dict[str, Any] = {
+        "caller_spoke": False,
+        "caller_transcript_last": 0.0,
+        "assistant_audio_last": 0.0,
+    }
 
     try:
         first = json.loads(await asyncio.wait_for(websocket.receive_text(), timeout=10))
@@ -1479,15 +1606,34 @@ async def media(websocket: WebSocket, token: str) -> None:
                     options,
                     call_sid,
                     caller,
+                    activity,
                 ),
                 name="openai_to_twilio",
             )
+            silence_monitor = asyncio.create_task(
+                initial_silence_monitor(
+                    openai_ws,
+                    activity,
+                    options,
+                ),
+                name="initial_silence_monitor",
+            )
 
             done, pending = await asyncio.wait(
-                {inbound, outbound},
+                {inbound, outbound, silence_monitor},
                 timeout=max_seconds,
                 return_when=asyncio.FIRST_COMPLETED,
             )
+
+            # The silence monitor normally returns as soon as the caller speaks.
+            # It should not end an otherwise active call, so keep the bridge alive
+            # until inbound or outbound finishes.
+            if silence_monitor in done and inbound not in done and outbound not in done:
+                done, pending = await asyncio.wait(
+                    {inbound, outbound},
+                    timeout=max_seconds,
+                    return_when=asyncio.FIRST_COMPLETED,
+                )
 
             for task in pending:
                 task.cancel()

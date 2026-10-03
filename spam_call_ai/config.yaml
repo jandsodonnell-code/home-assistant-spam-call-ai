@@ -1,5 +1,5 @@
 name: "Spam Call AI"
-version: "0.8.8"
+version: "0.8.9"
 slug: "spam_call_ai"
 description: "AI voice screening for inbound Twilio calls using OpenAI GPT-Live"
 url: "https://github.com/jandsodonnell-code/home-assistant-spam-call-ai"

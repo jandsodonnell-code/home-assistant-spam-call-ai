@@ -380,6 +380,8 @@ async def _publish_dashboard_entities() -> None:
     activity = _last_dashboard_activity()
     google = base.google_contacts_status()
     last_sync = _iso_utc(google.get("last_sync_unix"))
+    blocked_entries = base.blocked_caller_entries()
+    blocked_numbers = sorted(base.blocked_caller_numbers())
 
     if google.get("last_error"):
         google_status = "Error"
@@ -530,6 +532,16 @@ async def _publish_dashboard_entities() -> None:
             {
                 "friendly_name": "Spam Call AI Google Last Sync",
                 "icon": "mdi:sync",
+            },
+        ),
+        (
+            "sensor.spam_call_ai_blocked_callers",
+            len(blocked_numbers),
+            {
+                "friendly_name": "Spam Call AI Blocked Callers",
+                "icon": "mdi:phone-off",
+                "numbers": blocked_numbers,
+                "entries": blocked_entries[-50:],
             },
         ),
     ]

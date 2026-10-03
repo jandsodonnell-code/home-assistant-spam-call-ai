@@ -32,10 +32,11 @@ PUBLIC_URL_PATH = Path("/data/public_url.txt")
 GOOGLE_TOKEN_PATH = Path("/data/google_oauth.json")
 GOOGLE_STATE_PATH = Path("/data/google_oauth_state.json")
 GOOGLE_CONTACTS_PATH = Path("/data/google_trusted_contacts.json")
+BLOCKED_CALLERS_PATH = Path("/data/blocked_callers.json")
 GOOGLE_SCOPE = "https://www.googleapis.com/auth/contacts.readonly"
 OPENAI_LIVE_URL = "wss://api.openai.com/v1/live/sessions"
 
-APP_VERSION = "0.8.8"
+APP_VERSION = "0.8.9"
 app = FastAPI(title="Spam Call AI", version=APP_VERSION)
 active_calls: dict[str, dict[str, Any]] = {}
 
@@ -258,6 +259,78 @@ def save_json_file(path: Path, data: dict[str, Any]) -> None:
         json.dumps(data, indent=2, ensure_ascii=False),
         encoding="utf-8",
     )
+
+
+def blocked_caller_entries() -> list[dict[str, Any]]:
+    data = load_json_file(BLOCKED_CALLERS_PATH)
+    entries = data.get("entries")
+    return entries if isinstance(entries, list) else []
+
+
+def blocked_caller_numbers() -> set[str]:
+    return {
+        normalize_phone_number(str(entry.get("number") or ""))
+        for entry in blocked_caller_entries()
+        if normalize_phone_number(str(entry.get("number") or ""))
+    }
+
+
+def is_blocked_caller(caller: str) -> bool:
+    number = normalize_phone_number(caller)
+    return bool(number) and number in blocked_caller_numbers()
+
+
+def add_blocked_caller(
+    caller: str,
+    classification: str,
+    reason: str,
+    call_sid: str = "",
+) -> bool:
+    number = normalize_phone_number(caller)
+    if not number:
+        return False
+
+    entries = blocked_caller_entries()
+    now = time.time()
+    updated = False
+
+    for entry in entries:
+        if normalize_phone_number(str(entry.get("number") or "")) == number:
+            entry.update(
+                {
+                    "number": number,
+                    "classification": classification,
+                    "reason": reason,
+                    "last_seen_unix": now,
+                    "call_sid": call_sid,
+                }
+            )
+            updated = True
+            break
+
+    if not updated:
+        entries.append(
+            {
+                "number": number,
+                "classification": classification,
+                "reason": reason,
+                "blocked_at_unix": now,
+                "last_seen_unix": now,
+                "call_sid": call_sid,
+            }
+        )
+
+    save_json_file(
+        BLOCKED_CALLERS_PATH,
+        {"entries": entries, "updated_at_unix": now},
+    )
+    LOGGER.info(
+        "Blocked caller saved: number=%s classification=%s reason=%s",
+        number,
+        classification,
+        reason[:160],
+    )
+    return True
 
 
 def google_redirect_uri(options: dict[str, Any]) -> str:
@@ -584,99 +657,47 @@ company. Never treat the caller's self-asserted identity as verified.
 
 
 def prompt_text(transfer_enabled: bool = False) -> str:
-    transfer_text = """
-Live transfer is available.
-- When a caller explicitly asks to speak with, reach, or be connected to a person
-  at this number, including asking for someone by name, you MUST delegate the
-  transfer decision to the backend after you have their name/organization when
-  available and a specific reason for the call.
-- Do not require them to use the words "owner" or "transfer."
-- Tell them briefly that you will check whether you can connect them, then delegate.
-- Do not promise a transfer before the backend approves it.
-- If the backend does not approve a transfer, continue screening or take a message.
-""" if transfer_enabled else """
-Live transfer is not enabled. Take a concise message for legitimate callers and
-never promise an immediate transfer.
-"""
+    return """
+You are an automated phone screening assistant. Keep every call short and direct.
 
-    return f"""
-You are an automated telephone screening assistant for an inbound phone number.
+Your only goals are:
+1. For a legitimate caller, collect their name, callback number, and reason for
+   calling.
+2. For spam, scam, robocall, solicitation, political outreach, surveys, sales,
+   fundraising, or other unwanted calls, tell the caller to remove this number
+   from their calling list and not call again.
 
-At the beginning of the call, the application will instruct you to speak the
-configured opening greeting. Use the same voice and speaking style for the
-opening greeting and the rest of the conversation.
-
-If the caller does not speak, remain quiet and wait for the application's
-silence-handling instruction. Do not invent a caller response.
-
-Your role is to protect the phone owner from spam, scams, telemarketing, and
-unwanted solicitation while remaining courteous to legitimate callers.
-
-Speaking style:
-- Keep replies short, natural, and conversational, usually one or two sentences.
-- Be calm, friendly, patient, and inquisitive.
-- Do not claim to be human. If asked, say you are an automated AI call assistant.
-- Never claim to be law enforcement, a bank, government agency, lawyer, medical
-  professional, or another real person.
-- Do not threaten, insult, harass, or use sexual content.
-
-Privacy and security:
-- Never reveal, infer, confirm, or invent private information about the phone owner.
-- Never provide names, addresses, dates of birth, email addresses, passwords,
-  PINs, verification codes, account numbers, Social Security numbers, card or
-  banking information, device details, travel plans, family details, or whether
-  the owner is home or away.
-- Never open links, visit websites, download software, install apps, send money,
-  buy gift cards, transfer cryptocurrency, or agree to a purchase.
-- Never help a caller complete a login, payment, identity-verification process,
-  remote-access session, or account takeover.
-
-Call screening:
-- Ask the caller's name, organization, and reason for calling when useful.
-- If the caller seems legitimate, politely gather a brief message and callback
-  number if they voluntarily provide it. Say the message can be passed along.
-{transfer_text}
-
-Suspected spam, scam, robocall, or unsolicited sales:
-- Once the conversation gives you strong reason to believe the caller is spam,
-  scam, robocall, or unsolicited sales, switch into harmless time-waster mode.
-- In time-waster mode, keep the caller engaged for as long as practical within
-  the configured call limit, but never provide useful personal, financial,
-  account, device, location, family, or security information.
-- Ask only one short question at a time. Sound interested but mildly confused.
-- Make the caller repeat, restate, spell, or clarify details they already gave.
-- Ask for harmless specifics such as their department, company name, callback
-  number, case/reference number, mailing address for the company, or what they
-  claim will happen next.
-- Occasionally say you are trying to understand, looking for the right information,
-  or need them to explain a point again. Do not pretend to access a real account,
-  document, computer, bank record, government record, or private information.
+Conversation rules:
+- Use short sentences. Ask only one question at a time.
+- Do not make small talk and do not prolong the call.
+- Do not ask for extra details once you have enough information.
+- Never reveal or invent private information about the phone owner.
 - Never provide passwords, verification codes, account numbers, payment details,
-  identity information, addresses, dates of birth, Social Security numbers,
-  device access, remote access, links, downloads, gift cards, cryptocurrency,
-  or any other information or action that helps the caller.
-- Never make a payment, agree to a purchase, consent to a contract, or authorize
-  a transaction.
-- Do not disclose that the purpose is to occupy their time or that you have
-  classified them as spam.
-- Do not insult, threaten, harass, or escalate the caller.
-- If the caller becomes threatening, abusive, or unsafe, end the call.
-- If the caller becomes clearly legitimate, stop time-waster mode and return to
-  normal concise message-taking.
+  addresses, family information, location information, device access, links,
+  downloads, or any other sensitive information.
+- Do not make purchases, payments, commitments, or authorize transactions.
 
-Useful time-waster questions include:
-- "What company did you say you're calling from?"
-- "Can you spell the company name for me?"
-- "Which department are you with?"
-- "What is this regarding again?"
-- "How did you get this number?"
-- "Can you explain that one more time?"
-- "What would happen if I don't do that?"
-- "What was the reference or case number?"
-- "Can you repeat that number slowly?"
-- "What address does your company use for correspondence?"
+Legitimate caller flow:
+- Get the caller's NAME.
+- Get a CALLBACK NUMBER. If they say the number they are calling from is the best
+  callback number, accept that and do not ask again.
+- Get a short REASON FOR THE CALL.
+- Once all three are known, say: "Thank you. I'll pass along your name, number,
+  and reason for calling. Goodbye."
+- Do not continue the conversation after that.
+
+Spam/unwanted caller flow:
+- As soon as the call is clearly spam, scam, robocall, solicitation, political
+  outreach, survey, sales, or fundraising, stop asking questions.
+- Say: "Please remove this number from your call list and do not call again.
+  Goodbye."
+- Do not argue, explain, engage, or waste the caller's time.
+- The application will add the caller's number to its block list after the call
+  when the post-call classification confirms the call should be blocked.
+
+If you are uncertain whether the caller is legitimate, ask only what is necessary
+to determine their name and reason for calling. Keep the call concise.
 """.strip()
-
 
 
 async def update_twilio_call_for_transfer(
@@ -1869,6 +1890,29 @@ async def media(websocket: WebSocket, token: str) -> None:
                         **analysis,
                     },
                 )
+
+                classification = str(analysis.get("classification") or "").lower()
+                recommended_action = str(analysis.get("recommended_action") or "").lower()
+                should_block = (
+                    classification in {"telemarketing", "scam", "robocall"}
+                    or recommended_action == "block"
+                )
+                if should_block and not is_trusted_caller(options, caller):
+                    add_blocked_caller(
+                        caller,
+                        classification or "unknown",
+                        str(analysis.get("reason") or analysis.get("summary") or "Blocked after call analysis"),
+                        call_sid,
+                    )
+                    await fire_home_assistant_event(
+                        "spam_call_ai_caller_blocked",
+                        {
+                            "caller": normalize_phone_number(caller),
+                            "call_sid": call_sid,
+                            "classification": classification,
+                            "reason": str(analysis.get("reason") or analysis.get("summary") or ""),
+                        },
+                    )
         except Exception as exc:
             LOGGER.warning("Call analysis failed: %s", exc)
             result["analysis_error"] = str(exc)

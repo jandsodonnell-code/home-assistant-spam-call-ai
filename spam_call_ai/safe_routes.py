@@ -853,9 +853,20 @@ async def twiml_v7(request: Request) -> Response:
 
         return Response(content=xml, media_type="application/xml")
 
-    # Only non-safe callers enter the AI screening flow. Twilio <Gather>
-    # owns the two silence windows so the timing starts after each prompt
-    # finishes playing. The prompts are OpenAI TTS with the same configured
-    # voice used by GPT-Live.
+    if base.is_blocked_caller(caller):
+        LOGGER.info("BLOCKED CALLER rejected before AI: caller=%s", caller_norm)
+        await base.fire_home_assistant_event(
+            "spam_call_ai_blocked_call_rejected",
+            {
+                "caller": caller_norm,
+                "call_sid": call_sid,
+            },
+        )
+        return Response(
+            content='<?xml version="1.0" encoding="UTF-8"?><Response><Hangup/></Response>',
+            media_type="application/xml",
+        )
+
+    # Only non-safe, non-blocked callers enter the AI screening flow.
     xml = _first_screen_gather_twiml(options)
     return Response(content=xml, media_type="application/xml")

@@ -33,10 +33,11 @@ GOOGLE_TOKEN_PATH = Path("/data/google_oauth.json")
 GOOGLE_STATE_PATH = Path("/data/google_oauth_state.json")
 GOOGLE_CONTACTS_PATH = Path("/data/google_trusted_contacts.json")
 BLOCKED_CALLERS_PATH = Path("/data/blocked_callers.json")
+CALLER_HISTORY_PATH = Path("/data/caller_history.json")
 GOOGLE_SCOPE = "https://www.googleapis.com/auth/contacts.readonly"
 OPENAI_LIVE_URL = "wss://api.openai.com/v1/live/sessions"
 
-APP_VERSION = "0.8.9"
+APP_VERSION = "0.9.0"
 app = FastAPI(title="Spam Call AI", version=APP_VERSION)
 active_calls: dict[str, dict[str, Any]] = {}
 
@@ -331,6 +332,105 @@ def add_blocked_caller(
         reason[:160],
     )
     return True
+
+
+def remove_blocked_caller(caller: str) -> bool:
+    number = normalize_phone_number(caller)
+    if not number:
+        return False
+
+    entries = blocked_caller_entries()
+    kept = [
+        entry
+        for entry in entries
+        if normalize_phone_number(str(entry.get("number") or "")) != number
+    ]
+    if len(kept) == len(entries):
+        return False
+
+    save_json_file(
+        BLOCKED_CALLERS_PATH,
+        {"entries": kept, "updated_at_unix": time.time()},
+    )
+    LOGGER.info("Removed caller from local block list: number=%s", number)
+    return True
+
+
+def _caller_history_data() -> dict[str, Any]:
+    data = load_json_file(CALLER_HISTORY_PATH)
+    callers = data.get("callers")
+    if not isinstance(callers, dict):
+        callers = {}
+    return {"callers": callers}
+
+
+def no_message_call_count(caller: str) -> int:
+    number = normalize_phone_number(caller)
+    if not number:
+        return 0
+    data = _caller_history_data()
+    entry = data["callers"].get(number) or {}
+    try:
+        return int(entry.get("calls_since_message") or 0)
+    except (TypeError, ValueError):
+        return 0
+
+
+def register_incoming_call(caller: str, call_sid: str = "") -> int:
+    number = normalize_phone_number(caller)
+    if not number:
+        return 0
+
+    data = _caller_history_data()
+    callers = data["callers"]
+    entry = callers.get(number) or {}
+    count = int(entry.get("calls_since_message") or 0) + 1
+    total = int(entry.get("total_calls") or 0) + 1
+    now = time.time()
+
+    callers[number] = {
+        **entry,
+        "number": number,
+        "calls_since_message": count,
+        "total_calls": total,
+        "last_call_sid": call_sid,
+        "last_call_unix": now,
+    }
+    save_json_file(
+        CALLER_HISTORY_PATH,
+        {"callers": callers, "updated_at_unix": now},
+    )
+    LOGGER.info(
+        "Caller history updated: number=%s calls_since_message=%s total_calls=%s",
+        number,
+        count,
+        total,
+    )
+    return count
+
+
+def mark_message_left(caller: str, call_sid: str = "") -> None:
+    number = normalize_phone_number(caller)
+    if not number:
+        return
+
+    data = _caller_history_data()
+    callers = data["callers"]
+    entry = callers.get(number) or {}
+    now = time.time()
+
+    callers[number] = {
+        **entry,
+        "number": number,
+        "calls_since_message": 0,
+        "last_message_call_sid": call_sid,
+        "last_message_unix": now,
+    }
+    save_json_file(
+        CALLER_HISTORY_PATH,
+        {"callers": callers, "updated_at_unix": now},
+    )
+    LOGGER.info("Caller left a usable message; repeat-call count reset: number=%s", number)
 
 
 def google_redirect_uri(options: dict[str, Any]) -> str:
@@ -671,6 +771,10 @@ number they are calling from is the best callback number, accept that.
 Once name, callback number, and reason are known, say:
 "Thank you. I'll pass that along. Goodbye."
 Do not continue the conversation after that.
+
+If the caller says they were warned about repeated calls, do not debate the
+warning. Give them one concise opportunity to provide their name, callback number,
+and reason for calling.
 
 If the caller is clearly an unwanted sales or fraudulent call, stop asking
 questions and say:
@@ -1876,6 +1980,29 @@ async def media(websocket: WebSocket, token: str) -> None:
 
                 classification = str(analysis.get("classification") or "").lower()
                 recommended_action = str(analysis.get("recommended_action") or "").lower()
+                caller_name = str(analysis.get("caller_name") or "").strip()
+                reason = str(analysis.get("reason") or "").strip()
+                callback_number = str(analysis.get("callback_number") or "").strip()
+
+                usable_message = (
+                    classification == "legitimate"
+                    and bool(caller_name)
+                    and bool(reason)
+                    and bool(callback_number or normalize_phone_number(caller))
+                )
+
+                if usable_message:
+                    mark_message_left(caller, call_sid)
+                    if remove_blocked_caller(caller):
+                        await fire_home_assistant_event(
+                            "spam_call_ai_repeat_block_cleared",
+                            {
+                                "caller": normalize_phone_number(caller),
+                                "call_sid": call_sid,
+                                "reason": "Caller left a legitimate message.",
+                            },
+                        )
+
                 should_block = (
                     classification in {"telemarketing", "scam", "robocall"}
                     or recommended_action == "block"

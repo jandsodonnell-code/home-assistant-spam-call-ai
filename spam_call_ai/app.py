@@ -2023,6 +2023,29 @@ async def media(websocket: WebSocket, token: str) -> None:
                             "reason": str(analysis.get("reason") or analysis.get("summary") or ""),
                         },
                     )
+                elif not usable_message and not is_trusted_caller(options, caller):
+                    repeat_limit = int(options.get("repeat_no_message_limit", 3))
+                    repeat_count = no_message_call_count(caller)
+                    if repeat_count > repeat_limit:
+                        repeat_reason = (
+                            f"More than {repeat_limit} calls without leaving a complete message."
+                        )
+                        add_blocked_caller(
+                            caller,
+                            "spam",
+                            repeat_reason,
+                            call_sid,
+                        )
+                        await fire_home_assistant_event(
+                            "spam_call_ai_caller_blocked",
+                            {
+                                "caller": normalize_phone_number(caller),
+                                "call_sid": call_sid,
+                                "classification": "spam",
+                                "reason": repeat_reason,
+                                "repeat_no_message_count": repeat_count,
+                            },
+                        )
         except Exception as exc:
             LOGGER.warning("Call analysis failed: %s", exc)
             result["analysis_error"] = str(exc)

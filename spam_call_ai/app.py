@@ -1985,7 +1985,7 @@ async def media(websocket: WebSocket, token: str) -> None:
                 callback_number = str(analysis.get("callback_number") or "").strip()
 
                 usable_message = (
-                    classification == "legitimate"
+                    classification not in {"telemarketing", "scam", "robocall"}
                     and bool(caller_name)
                     and bool(reason)
                     and bool(callback_number or normalize_phone_number(caller))

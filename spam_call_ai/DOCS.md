@@ -477,3 +477,36 @@ through directly to a literal `<Hangup/>` in the same TwiML response.
 
 This gives the second silence window a local fail-safe: even if no empty-result
 webhook is sent, the call still ends.
+
+
+## Repeat callers without a message in 0.9.0
+
+The app now tracks each non-safe caller number across calls. The default
+`repeat_no_message_limit` is 3.
+
+A call is considered to have left a usable message when the post-call analysis
+has a caller name and reason for calling, plus either a stated callback number
+or the caller's incoming phone number, and the call is not classified as
+telemarketing, scam, or robocall.
+
+Behavior:
+
+1. Calls from trusted/safe contacts are not counted.
+2. Each non-safe, non-blocked incoming call increments that caller's
+   `calls_since_message` count.
+3. On the fourth call without a usable message, the opening prompt changes to:
+   "This number has called more than 3 times without leaving a message. Please
+   leave your name, callback number, and reason for calling now. If you do not,
+   this number will be marked as spam and blocked."
+4. If the caller still leaves no message after the warning and retry prompt, the
+   number is saved to the local Spam Call AI block list with classification
+   `spam`.
+5. If the caller responds but still fails to leave a complete message, the
+   post-call analysis also blocks the number once the repeat threshold has been
+   exceeded.
+6. If the caller leaves a complete non-spam message, the repeat count resets to
+   zero. If a repeat-call block had been applied during that call path, it is
+   cleared.
+
+Caller history is stored in `/data/caller_history.json`. The normal blocked
+caller list remains in `/data/blocked_callers.json`.

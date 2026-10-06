@@ -1,5 +1,5 @@
 name: "Spam Call AI"
-version: "0.8.9"
+version: "0.9.0"
 slug: "spam_call_ai"
 description: "AI voice screening for inbound Twilio calls using OpenAI GPT-Live"
 url: "https://github.com/jandsodonnell-code/home-assistant-spam-call-ai"
@@ -40,6 +40,7 @@ options:
   greeting: "Hi, you've reached the automated call assistant. Who's calling, and what are you calling about?"
   initial_response_timeout_seconds: 8
   second_response_timeout_seconds: 7
+  repeat_no_message_limit: 3
   validate_twilio_signature: true
 schema:
   openai_api_key: password
@@ -70,4 +71,5 @@ schema:
   greeting: str
   initial_response_timeout_seconds: "int(4,30)"
   second_response_timeout_seconds: "int(4,30)"
+  repeat_no_message_limit: "int(1,20)"
   validate_twilio_signature: bool

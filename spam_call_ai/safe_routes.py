@@ -41,6 +41,13 @@ async def _screen_prompt_wav(options: dict, kind: str) -> bytes:
             )
     elif kind == "retry":
         text = RETRY_PROMPT
+    elif kind == "repeat_warning":
+        limit = int(options.get("repeat_no_message_limit", 3))
+        text = (
+            f"This number has called more than {limit} times without leaving a message. "
+            "Please leave your name, callback number, and reason for calling now. "
+            "If you do not, this number will be marked as spam and blocked."
+        )
     else:
         raise HTTPException(status_code=404, detail="Unknown prompt")
 
@@ -113,9 +120,13 @@ def _live_screen_twiml(
     )
 
 
-def _first_screen_gather_twiml(options: dict) -> str:
+def _first_screen_gather_twiml(
+    options: dict,
+    repeat_warning: bool = False,
+) -> str:
     action_url = base.public_base_url(options) + "/screen/first-result"
-    prompt_url = _prompt_url(options, "opening")
+    prompt_kind = "repeat_warning" if repeat_warning else "opening"
+    prompt_url = _prompt_url(options, prompt_kind)
     timeout = int(options.get("initial_response_timeout_seconds", 8))
     return (
         '<?xml version="1.0" encoding="UTF-8"?>'
@@ -128,10 +139,21 @@ def _first_screen_gather_twiml(options: dict) -> str:
     )
 
 
-def _second_screen_gather_twiml(options: dict) -> str:
+def _second_screen_gather_twiml(
+    options: dict,
+    repeat_warning: bool = False,
+) -> str:
     action_url = base.public_base_url(options) + "/screen/second-result"
     prompt_url = _prompt_url(options, "retry")
     timeout = int(options.get("second_response_timeout_seconds", 7))
+    if repeat_warning:
+        no_message_url = base.public_base_url(options) + "/screen/repeat-no-message"
+        after_gather = (
+            f'<Redirect method="POST">{escape(no_message_url)}</Redirect>'
+        )
+    else:
+        after_gather = "<Hangup/>"
+
     return (
         '<?xml version="1.0" encoding="UTF-8"?>'
         "<Response>"
@@ -139,7 +161,7 @@ def _second_screen_gather_twiml(options: dict) -> str:
         f'action={quoteattr(action_url)} method="POST">'
         f"<Play>{escape(prompt_url)}</Play>"
         "</Gather>"
-        "<Hangup/>"
+        f"{after_gather}"
         "</Response>"
     )
 
@@ -179,7 +201,12 @@ async def screen_first_result(request: Request) -> Response:
             "No speech after %ss opening window; playing one retry prompt",
             int(options.get("initial_response_timeout_seconds", 8)),
         )
-        xml = _second_screen_gather_twiml(options)
+        repeat_limit = int(options.get("repeat_no_message_limit", 3))
+        repeat_warning = base.no_message_call_count(caller) > repeat_limit
+        xml = _second_screen_gather_twiml(
+            options,
+            repeat_warning=repeat_warning,
+        )
 
     return Response(content=xml, media_type="application/xml")
 
@@ -214,6 +241,51 @@ async def screen_second_result(request: Request) -> Response:
     return Response(content=xml, media_type="application/xml")
 
 
+@app.post("/screen/repeat-no-message")
+async def screen_repeat_no_message(request: Request) -> Response:
+    options = base.load_options()
+    form = await request.form()
+    form_data = dict(form)
+    _validate_twilio_action(request, form_data, options)
+
+    caller = str(form_data.get("From") or "unknown")
+    call_sid = str(form_data.get("CallSid") or "")
+    repeat_limit = int(options.get("repeat_no_message_limit", 3))
+    repeat_count = base.no_message_call_count(caller)
+
+    if (
+        repeat_count > repeat_limit
+        and not base.is_trusted_caller(options, caller)
+    ):
+        reason = f"More than {repeat_limit} calls without leaving a message."
+        base.add_blocked_caller(
+            caller,
+            "spam",
+            reason,
+            call_sid,
+        )
+        LOGGER.info(
+            "Repeat caller blocked after final no-message warning: caller=%s count=%s",
+            base.normalize_phone_number(caller),
+            repeat_count,
+        )
+        await base.fire_home_assistant_event(
+            "spam_call_ai_caller_blocked",
+            {
+                "caller": base.normalize_phone_number(caller),
+                "call_sid": call_sid,
+                "classification": "spam",
+                "reason": reason,
+                "repeat_no_message_count": repeat_count,
+            },
+        )
+
+    return Response(
+        content='<?xml version="1.0" encoding="UTF-8"?><Response><Hangup/></Response>',
+        media_type="application/xml",
+    )
+
+
 @app.on_event("startup")
 async def warm_screening_prompts() -> None:
     async def _warm() -> None:
@@ -221,6 +293,7 @@ async def warm_screening_prompts() -> None:
             options = base.load_options()
             await _screen_prompt_wav(options, "opening")
             await _screen_prompt_wav(options, "retry")
+            await _screen_prompt_wav(options, "repeat_warning")
             LOGGER.info("Screening voice prompts ready")
         except Exception as exc:
             LOGGER.warning("Could not pre-generate screening prompts: %s", exc)
@@ -879,6 +952,32 @@ async def twiml_v7(request: Request) -> Response:
             media_type="application/xml",
         )
 
+    # Count each non-safe, non-blocked incoming call. A successful legitimate
+    # message later resets this count in app.py.
+    repeat_count = base.register_incoming_call(caller, call_sid)
+    repeat_limit = int(options.get("repeat_no_message_limit", 3))
+    repeat_warning = repeat_count > repeat_limit
+
+    if repeat_warning:
+        LOGGER.info(
+            "Repeat no-message warning enabled: caller=%s count=%s limit=%s",
+            caller_norm,
+            repeat_count,
+            repeat_limit,
+        )
+        await base.fire_home_assistant_event(
+            "spam_call_ai_repeat_warning",
+            {
+                "caller": caller_norm,
+                "call_sid": call_sid,
+                "repeat_no_message_count": repeat_count,
+                "limit": repeat_limit,
+            },
+        )
+
     # Only non-safe, non-blocked callers enter the AI screening flow.
-    xml = _first_screen_gather_twiml(options)
+    xml = _first_screen_gather_twiml(
+        options,
+        repeat_warning=repeat_warning,
+    )
     return Response(content=xml, media_type="application/xml")

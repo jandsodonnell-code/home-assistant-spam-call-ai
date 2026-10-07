@@ -510,3 +510,13 @@ Behavior:
 
 Caller history is stored in `/data/caller_history.json`. The normal blocked
 caller list remains in `/data/blocked_callers.json`.
+
+
+## Incoming call time in 0.9.1
+
+The app now records the timestamp as soon as an inbound call reaches the Twilio
+webhook. Home Assistant publishes this as
+`sensor.spam_call_ai_last_received_time` with timestamp device class, so the
+dashboard shows the call in the Home Assistant local time zone.
+
+The Last Call section now includes **Call Received**.

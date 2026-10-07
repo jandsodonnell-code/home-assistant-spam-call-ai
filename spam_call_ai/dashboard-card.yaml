@@ -59,6 +59,8 @@ cards:
           name: Caller
         - entity: sensor.spam_call_ai_last_caller
           name: Number
+        - entity: sensor.spam_call_ai_last_received_time
+          name: Call Received
         - entity: sensor.spam_call_ai_last_call_type
           name: Call Type
         - entity: sensor.spam_call_ai_last_classification

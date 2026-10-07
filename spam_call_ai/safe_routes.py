@@ -16,6 +16,7 @@ LOGGER = logging.getLogger("spam_call_ai.safe")
 app = base.app
 SAFE_MESSAGE_PATH = Path("/data/last_safe_message.json")
 SAFE_CALL_PATH = Path("/data/last_safe_call.json")
+LAST_RECEIVED_CALL_PATH = Path("/data/last_received_call.json")
 SCREEN_PROMPT_DIR = Path("/data/spam_call_ai_prompts")
 SCREEN_PROMPT_DIR.mkdir(parents=True, exist_ok=True)
 
@@ -451,6 +452,7 @@ async def _write_ha_states(states: list[tuple[str, object, dict]]) -> None:
 
 async def _publish_dashboard_entities() -> None:
     activity = _last_dashboard_activity()
+    last_received = base.load_json_file(LAST_RECEIVED_CALL_PATH)
     google = base.google_contacts_status()
     last_sync = _iso_utc(google.get("last_sync_unix"))
     blocked_entries = base.blocked_caller_entries()
@@ -588,6 +590,17 @@ async def _publish_dashboard_entities() -> None:
             {
                 "friendly_name": "Spam Call AI Last Call Time",
                 "icon": "mdi:clock-outline",
+            },
+        ),
+        (
+            "sensor.spam_call_ai_last_received_time",
+            _iso_utc(last_received.get("received_at_unix")),
+            {
+                "friendly_name": "Spam Call AI Call Received",
+                "icon": "mdi:clock-outline",
+                "device_class": "timestamp",
+                "caller": str(last_received.get("caller") or "Unknown"),
+                "call_sid": str(last_received.get("call_sid") or ""),
             },
         ),
         (
@@ -855,6 +868,15 @@ async def twiml_v7(request: Request) -> Response:
 
     caller = str(form_data.get("From") or "unknown")
     call_sid = str(form_data.get("CallSid") or "")
+    received_at_unix = time.time()
+    base.save_json_file(
+        LAST_RECEIVED_CALL_PATH,
+        {
+            "caller": caller,
+            "call_sid": call_sid,
+            "received_at_unix": received_at_unix,
+        },
+    )
     account_sid = str(form_data.get("AccountSid") or "")
     to_number = str(form_data.get("To") or "")
 

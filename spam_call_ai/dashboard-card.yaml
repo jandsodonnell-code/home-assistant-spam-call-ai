@@ -11,9 +11,10 @@ cards:
 
       **Active calls:** {{ states('sensor.spam_call_ai_active_calls') }}
       **Safe callers:** {{ states('sensor.spam_call_ai_safe_contacts') }}
+      **Blocked callers:** {{ states('sensor.spam_call_ai_blocked_callers') }}
 
   - type: grid
-    columns: 4
+    columns: 3
     square: false
     cards:
       - type: button
@@ -41,6 +42,13 @@ cards:
         entity: input_boolean.spam_call_ai_show_google_contacts
         name: Google
         icon: mdi:contacts
+        show_state: false
+        tap_action:
+          action: toggle
+      - type: button
+        entity: input_boolean.spam_call_ai_show_blocked_callers
+        name: Blocked
+        icon: mdi:phone-off
         show_state: false
         tap_action:
           action: toggle
@@ -127,3 +135,28 @@ cards:
           name: Sync Status
         - entity: sensor.spam_call_ai_google_last_sync
           name: Last Sync
+
+
+  - type: conditional
+    conditions:
+      - condition: state
+        entity: input_boolean.spam_call_ai_show_blocked_callers
+        state: "on"
+    card:
+      type: markdown
+      title: Blocked Callers
+      content: |
+        {% set entries = state_attr('sensor.spam_call_ai_blocked_callers', 'entries') or [] %}
+        {% if entries %}
+        {% for entry in entries | reverse %}
+        📵 **{{ entry.number | default('Unknown') }}**
+        {% if entry.classification is defined %} — {{ entry.classification | title }}{% endif %}
+        {% if entry.reason is defined and entry.reason %}
+
+        {{ entry.reason }}
+        {% endif %}
+
+        {% endfor %}
+        {% else %}
+        No blocked callers are currently listed.
+        {% endif %}

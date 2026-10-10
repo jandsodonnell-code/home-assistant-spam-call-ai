@@ -14,13 +14,14 @@ cards:
       **Blocked callers:** {{ states('sensor.spam_call_ai_blocked_callers') }}
 
   - type: grid
-    columns: 3
+    columns: 5
     square: false
     cards:
       - type: button
         entity: input_boolean.spam_call_ai_show_last_call
-        name: Last Call
+        name: Last
         icon: mdi:phone-log
+        icon_height: 24px
         show_state: false
         tap_action:
           action: toggle
@@ -28,6 +29,7 @@ cards:
         entity: input_boolean.spam_call_ai_show_summary
         name: Summary
         icon: mdi:text-box-outline
+        icon_height: 24px
         show_state: false
         tap_action:
           action: toggle
@@ -35,6 +37,7 @@ cards:
         entity: input_boolean.spam_call_ai_show_safe_callers
         name: Safe
         icon: mdi:account-check
+        icon_height: 24px
         show_state: false
         tap_action:
           action: toggle
@@ -42,6 +45,7 @@ cards:
         entity: input_boolean.spam_call_ai_show_google_contacts
         name: Google
         icon: mdi:contacts
+        icon_height: 24px
         show_state: false
         tap_action:
           action: toggle
@@ -49,6 +53,7 @@ cards:
         entity: input_boolean.spam_call_ai_show_blocked_callers
         name: Blocked
         icon: mdi:phone-off
+        icon_height: 24px
         show_state: false
         tap_action:
           action: toggle

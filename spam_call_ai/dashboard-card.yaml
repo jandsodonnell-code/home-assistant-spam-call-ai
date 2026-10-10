@@ -132,14 +132,27 @@ cards:
         entity: input_boolean.spam_call_ai_show_google_contacts
         state: "on"
     card:
-      type: entities
-      title: Google Contacts
-      show_header_toggle: false
-      entities:
-        - entity: sensor.spam_call_ai_google_sync_status
-          name: Sync Status
-        - entity: sensor.spam_call_ai_google_last_sync
-          name: Last Sync
+      type: vertical-stack
+      cards:
+        - type: entities
+          title: Google Contacts
+          show_header_toggle: false
+          entities:
+            - entity: sensor.spam_call_ai_google_sync_status
+              name: Sync Status
+            - entity: sensor.spam_call_ai_google_last_sync
+              name: Last Sync
+        - type: conditional
+          conditions:
+            - condition: state
+              entity: sensor.spam_call_ai_google_sync_status
+              state: "Error"
+          card:
+            type: markdown
+            content: |
+              **Google Contacts sync error**
+
+              {{ state_attr('sensor.spam_call_ai_google_sync_status', 'last_error') or 'No error detail was provided.' }}
 
 
   - type: conditional

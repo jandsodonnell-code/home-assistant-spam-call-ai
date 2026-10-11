@@ -1,0 +1,16 @@
+# Append this list entry to your existing template: list in configuration.yaml.
+# If you do not have template: yet, add that key above this entry.
+- triggers:
+    - trigger: event
+      event_type: ai_home_status_report
+  sensor:
+    - name: AI Home Status
+      unique_id: ai_home_status_report_v1
+      device_class: timestamp
+      state: '{{ trigger.event.data.completed_at }}'
+      icon: mdi:home-search
+      attributes:
+        summary: '{{ trigger.event.data.summary }}'
+        source: '{{ trigger.event.data.source }}'
+        captured_at: '{{ trigger.event.data.captured_at }}'
+        entity_count: '{{ trigger.event.data.entity_count }}'

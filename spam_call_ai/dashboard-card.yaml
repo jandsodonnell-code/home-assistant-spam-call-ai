@@ -142,6 +142,14 @@ cards:
               name: Sync Status
             - entity: sensor.spam_call_ai_google_last_sync
               name: Last Sync
+        - type: button
+          name: Sync Google Contacts
+          icon: mdi:sync
+          tap_action:
+            action: perform-action
+            perform_action: rest_command.spam_call_ai_google_sync
+          hold_action:
+            action: none
         - type: conditional
           conditions:
             - condition: state

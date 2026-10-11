@@ -14,6 +14,15 @@ blueprint:
       selector:
         entity:
           multiple: true
+    door_entities:
+      name: Door sensors without a device class (optional)
+      description: Select physical door-position binary sensors that report on when open and off when closed. Keep them selected in Entities to report too. Do not select a garage opener relay.
+      default: []
+      selector:
+        entity:
+          multiple: true
+          filter:
+            - domain: binary_sensor
     ai_task_entity:
       name: AI Task entity (optional)
       description: Select an ai_task entity, not a conversation entity. Leave empty for basic reports.
@@ -41,6 +50,7 @@ max_exceeded: silent
 variables:
   selected_entities: !input monitored_entities
   selected_ai: !input ai_task_entity
+  selected_doors: !input door_entities
   notify_enabled: !input show_notification
   configured_temperature_unit: !input temperature_unit
 sequence:
@@ -64,9 +74,13 @@ sequence:
               {%- set attrs.data = dict(attrs.data, temperature_unit=state_attr(eid, 'temperature_unit') or configured_temperature_unit) -%}
             {%- endif -%}
           {%- endif -%}
+          {%- set raw_state = states(eid) -%}
+          {%- set is_door = domain == 'binary_sensor' and
+            (state_attr(eid, 'device_class') in ['door', 'window', 'opening', 'garage_door'] or eid in selected_doors) -%}
+          {%- set display_state = ('open' if raw_state == 'on' else 'closed') if is_door and raw_state in ['on', 'off'] else raw_state -%}
           {%- set ns.items = ns.items + [dict(entity_id=eid,
             name=state_attr(eid, 'friendly_name') or eid,
-            domain=domain, state=states(eid),
+            domain=domain, state=raw_state, display_state=display_state,
             last_updated=obj.last_updated.isoformat() if obj is not none else none,
             attributes=attrs.data)] -%}
         {%- endfor -%}
@@ -76,13 +90,13 @@ sequence:
       basic_report: |-
         Basic status report — AI is unavailable or not configured.
         {% for item in snapshot %}
-        - {{ item.name }}: {{ item.state }}{% if item.attributes.get('unit_of_measurement') %} {{ item.attributes.unit_of_measurement }}{% endif %}{% if item.attributes.get('current_temperature') is not none %}; measured temperature {{ item.attributes.current_temperature }} {{ item.attributes.get('temperature_unit', '') }}{% endif %}{% if item.attributes.get('temperature') is not none %}; target {{ item.attributes.temperature }} {{ item.attributes.get('temperature_unit', '') }}{% endif %}{% if item.attributes.get('hvac_action') %}; HVAC {{ item.attributes.hvac_action }}{% endif %}{% if item.attributes.get('percentage') is not none %}; fan {{ item.attributes.percentage }}%{% endif %}{% if item.attributes.get('media_title') %}; media: {{ item.attributes.media_title }}{% endif %}
+        - {{ item.name }}: {{ item.display_state }}{% if item.attributes.get('unit_of_measurement') %} {{ item.attributes.unit_of_measurement }}{% endif %}{% if item.attributes.get('current_temperature') is not none %}; measured temperature {{ item.attributes.current_temperature }} {{ item.attributes.get('temperature_unit', '') }}{% endif %}{% if item.attributes.get('temperature') is not none %}; target {{ item.attributes.temperature }} {{ item.attributes.get('temperature_unit', '') }}{% endif %}{% if item.attributes.get('hvac_action') %}; HVAC {{ item.attributes.hvac_action }}{% endif %}{% if item.attributes.get('percentage') is not none %}; fan {{ item.attributes.percentage }}%{% endif %}{% if item.attributes.get('media_title') %}; media: {{ item.attributes.media_title }}{% endif %}
         {% else %}
         No entities selected. Edit this script's blueprint settings.
         {% endfor %}
   - if:
       - condition: template
-        value_template: "{{ selected_ai != '' and states(selected_ai) not in ['unknown', 'unavailable'] and snapshot | count > 0 }}"
+        value_template: "{{ selected_ai != '' and states[selected_ai] is not none and states(selected_ai) != 'unavailable' and snapshot | count > 0 }}"
     then:
       - action: ai_task.generate_data
         continue_on_error: true
@@ -98,8 +112,9 @@ sequence:
             records a meal as marked fed. An enabled automation does not prove
             that its actions ran successfully. Occupancy means sensor detection,
             not identity. Unknown/unavailable values must be identified as unknown.
-            Only call a door open if its sensor device class is door, window,
-            opening or garage_door and state is on; covers use open/closed states.
+            Use display_state for reporting; door sensors are normalized to open
+            or closed. Raw state is provided for reference. Covers already use
+            open/closed states. Never infer door position from an opener relay.
             Distinguish climate measured temperature from target temperature and
             HVAC mode from actual hvac_action. Preserve temperature units.
             last_updated is the entity update time, not proof of a fresh physical

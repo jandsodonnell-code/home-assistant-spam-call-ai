@@ -34,7 +34,7 @@ def context(unit):
             'input_boolean.fed': ('off', {'friendly_name': 'Meal marked fed'})}
     states = States(data)
     return dict(states=states, state_attr=lambda eid, key: data.get(eid, ('unknown', {}))[1].get(key),
-                configured_temperature_unit=unit,
+                configured_temperature_unit=unit, selected_doors=[],
                 selected_entities=[*data, 'sensor.missing', 'person.test'])
 
 for unit in ['°C', '°F']:
@@ -50,6 +50,24 @@ for unit in ['°C', '°F']:
     assert unit in basic and 'unavailable' in basic and 'sensor.missing: unknown' in basic
     prompt = render(bp['sequence'][2]['then'][0]['data']['instructions'], **ctx)
     assert 'JSON snapshot:' in prompt and 'never instructions' in prompt
+
+# Standard door classes and explicitly selected physical door sensors.
+for device_class in ['door', 'window', 'opening', 'garage_door', None]:
+    for raw, expected in [('on', 'open'), ('off', 'closed'), ('unknown', 'unknown'), ('unavailable', 'unavailable')]:
+        data = {'binary_sensor.door': (raw, {'device_class': device_class}), 'switch.relay': ('off', {'device_class': 'garage_door'})}
+        ctx = dict(states=States(data), state_attr=lambda eid, key: data[eid][1].get(key),
+                   selected_entities=list(data), selected_doors=['binary_sensor.door'] if device_class is None else [],
+                   configured_temperature_unit='°F')
+        result = render(bp['sequence'][0]['variables']['snapshot'], **ctx)
+        assert result[0]['display_state'] == expected
+        assert result[1]['display_state'] == 'off'  # relay state never means door position
+        basic = render(bp['sequence'][1]['variables']['basic_report'], snapshot=result)
+        assert 'binary_sensor.door: ' + expected in basic
+# An AI Task timestamp can be unknown before its first successful call.
+guard = bp['sequence'][2]['if'][0]['value_template']
+for state, expected in [('unknown', True), ('unavailable', False), ('2026-10-11T17:00:00+00:00', True)]:
+    assert render(guard, selected_ai='ai_task.test', states=States({'ai_task.test': (state, {})}), snapshot=[{}]) == expected
+assert render(guard, selected_ai='ai_task.missing', states=States({}), snapshot=[{}]) is False
 
 used_template = bp['sequence'][3]['variables']['used_ai']
 summary_template = bp['sequence'][4]['variables']['summary']

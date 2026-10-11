@@ -1,0 +1,29 @@
+type: vertical-stack
+cards:
+  - type: button
+    name: Check the house
+    icon: mdi:home-search
+    entity: script.ai_home_status_assistant
+    show_state: true
+    tap_action:
+      action: perform-action
+      perform_action: script.turn_on
+      target:
+        entity_id: script.ai_home_status_assistant
+  - type: markdown
+    title: Home status
+    content: >-
+      {% set report = state_attr('sensor.ai_home_status', 'summary') %}
+      {% if report %}
+      {{ report }}
+
+      ---
+
+      **Source:** {{ state_attr('sensor.ai_home_status', 'source') }}
+
+      **Snapshot:** {{ as_timestamp(state_attr('sensor.ai_home_status', 'captured_at')) | timestamp_custom('%m/%d/%Y %I:%M %p', true) }}
+
+      *This is the last requested report. Press Check the house to refresh.*
+      {% else %}
+      Press **Check the house** to create your first report.
+      {% endif %}

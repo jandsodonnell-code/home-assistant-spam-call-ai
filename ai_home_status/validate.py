@@ -5,6 +5,7 @@ from pathlib import Path
 from types import SimpleNamespace
 import yaml
 from jinja2.nativetypes import NativeEnvironment
+from jinja2 import StrictUndefined
 
 class Loader(yaml.SafeLoader):
     pass
@@ -13,7 +14,7 @@ root = Path(__file__).parent
 bp = yaml.load((root / 'home_status.yaml').read_text(), Loader=Loader)
 for file in ['status_sensor.yaml', 'dashboard_card.yaml']:
     yaml.safe_load((root / file).read_text())
-env = NativeEnvironment()
+env = NativeEnvironment(undefined=StrictUndefined)
 env.filters['to_json'] = json.dumps
 now = datetime.now(timezone.utc)
 class States:
@@ -33,7 +34,7 @@ def context(unit):
             'input_boolean.fed': ('off', {'friendly_name': 'Meal marked fed'})}
     states = States(data)
     return dict(states=states, state_attr=lambda eid, key: data.get(eid, ('unknown', {}))[1].get(key),
-                config=SimpleNamespace(units=SimpleNamespace(temperature_unit=unit)),
+                configured_temperature_unit=unit,
                 selected_entities=[*data, 'sensor.missing', 'person.test'])
 
 for unit in ['°C', '°F']:

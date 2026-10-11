@@ -22,6 +22,15 @@ blueprint:
         entity:
           filter:
             - domain: ai_task
+    temperature_unit:
+      name: Climate temperature unit
+      description: Match the temperature unit shown for your climate devices in Home Assistant.
+      default: '°F'
+      selector:
+        select:
+          options:
+            - '°F'
+            - '°C'
     show_notification:
       name: Show a Home Assistant notification
       default: true
@@ -33,6 +42,7 @@ variables:
   selected_entities: !input monitored_entities
   selected_ai: !input ai_task_entity
   notify_enabled: !input show_notification
+  configured_temperature_unit: !input temperature_unit
 sequence:
   - variables:
       captured_at: '{{ now().isoformat() }}'
@@ -51,7 +61,7 @@ sequence:
               {%- endif -%}
             {%- endfor -%}
             {%- if domain == 'climate' -%}
-              {%- set attrs.data = dict(attrs.data, temperature_unit=config.units.temperature_unit) -%}
+              {%- set attrs.data = dict(attrs.data, temperature_unit=state_attr(eid, 'temperature_unit') or configured_temperature_unit) -%}
             {%- endif -%}
           {%- endif -%}
           {%- set ns.items = ns.items + [dict(entity_id=eid,

@@ -349,6 +349,14 @@ def _state_text(value, fallback: str = "Unknown") -> str:
 def _last_dashboard_activity() -> dict:
     ai_call = base.load_json_file(base.LAST_CALL_PATH)
     safe_call = base.load_json_file(SAFE_CALL_PATH)
+    last_received = base.load_json_file(LAST_RECEIVED_CALL_PATH)
+
+    try:
+        received_time = float(last_received.get("received_at_unix") or 0)
+    except (TypeError, ValueError):
+        received_time = 0
+    received_sid = str(last_received.get("call_sid") or "")
+    received_caller = str(last_received.get("caller") or "Unknown")
 
     try:
         ai_time = float(ai_call.get("ended_at_unix") or 0)
@@ -359,19 +367,119 @@ def _last_dashboard_activity() -> dict:
     except (TypeError, ValueError):
         safe_time = 0
 
+    ai_sid = str(ai_call.get("call_sid") or "")
+    safe_sid = str(safe_call.get("call_sid") or "")
+
+    # Prefer the record that belongs to the actual most recent inbound CallSid.
+    # This prevents an older safe caller from remaining on the dashboard when a
+    # newer caller was blocked, stayed silent, or never opened a GPT-Live stream.
+    if received_time > 0 and received_sid:
+        if safe_sid == received_sid:
+            status = str(safe_call.get("status") or "safe").replace("_", " ").title()
+            summary = str(
+                safe_call.get("summary")
+                or "Safe caller bypassed AI."
+            ).strip()
+            return {
+                "caller": received_caller,
+                "caller_name": str(
+                    safe_call.get("trusted_name")
+                    or base.google_synced_name_for_number(received_caller)
+                    or "Safe caller"
+                ),
+                "call_type": "Safe caller",
+                "classification": "Safe",
+                "spam_likelihood_percent": 0,
+                "summary": summary,
+                "callback_number": "",
+                "duration_seconds": safe_call.get("duration_seconds") or 0,
+                "action": status,
+                "time_unix": received_time,
+                "ai_used": False,
+                "status": status,
+            }
+
+        if ai_sid == received_sid:
+            analysis = ai_call.get("analysis") or {}
+            try:
+                spam_percent = round(float(analysis.get("spam_likelihood") or 0) * 100)
+            except (TypeError, ValueError):
+                spam_percent = 0
+            classification = _state_text(
+                analysis.get("classification"),
+                "Unknown",
+            ).title()
+            return {
+                "caller": received_caller,
+                "caller_name": _state_text(analysis.get("caller_name"), "Unknown"),
+                "call_type": "AI screened",
+                "classification": classification,
+                "spam_likelihood_percent": spam_percent,
+                "summary": _state_text(
+                    analysis.get("summary"),
+                    "AI-screened call completed.",
+                ),
+                "callback_number": str(analysis.get("callback_number") or ""),
+                "duration_seconds": ai_call.get("duration_seconds") or 0,
+                "action": _state_text(
+                    analysis.get("recommended_action"),
+                    "Review",
+                ).title(),
+                "time_unix": received_time,
+                "ai_used": True,
+                "status": "Completed",
+            }
+
+        if base.is_blocked_caller(received_caller):
+            return {
+                "caller": received_caller,
+                "caller_name": "Blocked caller",
+                "call_type": "Blocked caller",
+                "classification": "Blocked",
+                "spam_likelihood_percent": 100,
+                "summary": "Blocked caller was rejected before AI screening.",
+                "callback_number": "",
+                "duration_seconds": 0,
+                "action": "Rejected",
+                "time_unix": received_time,
+                "ai_used": False,
+                "status": "Rejected",
+            }
+
+        return {
+            "caller": received_caller,
+            "caller_name": (
+                base.google_synced_name_for_number(received_caller)
+                or "Unknown"
+            ),
+            "call_type": "Incoming call",
+            "classification": "Pending",
+            "spam_likelihood_percent": 0,
+            "summary": (
+                "Latest incoming call has no completed screening record yet. "
+                "The caller may have stayed silent or disconnected early."
+            ),
+            "callback_number": "",
+            "duration_seconds": 0,
+            "action": "Received",
+            "time_unix": received_time,
+            "ai_used": False,
+            "status": "Received",
+        }
+
+    # Backward-compatible fallback for installations that do not yet have a
+    # last_received_call.json record.
     if safe_time >= ai_time and safe_time > 0:
         status = str(safe_call.get("status") or "safe").replace("_", " ").title()
-        summary = str(
-            safe_call.get("summary")
-            or "Safe caller bypassed AI."
-        ).strip()
         return {
             "caller": str(safe_call.get("caller") or "Unknown"),
             "caller_name": str(safe_call.get("trusted_name") or "Safe caller"),
             "call_type": "Safe caller",
             "classification": "Safe",
             "spam_likelihood_percent": 0,
-            "summary": summary,
+            "summary": str(
+                safe_call.get("summary") or "Safe caller bypassed AI."
+            ).strip(),
             "callback_number": "",
             "duration_seconds": safe_call.get("duration_seconds") or 0,
             "action": status,
@@ -425,7 +533,6 @@ def _last_dashboard_activity() -> dict:
         "ai_used": False,
         "status": "No calls yet",
     }
-
 
 async def _write_ha_states(states: list[tuple[str, object, dict]]) -> None:
     token = os.environ.get("SUPERVISOR_TOKEN")
@@ -868,15 +975,6 @@ async def twiml_v7(request: Request) -> Response:
 
     caller = str(form_data.get("From") or "unknown")
     call_sid = str(form_data.get("CallSid") or "")
-    received_at_unix = time.time()
-    base.save_json_file(
-        LAST_RECEIVED_CALL_PATH,
-        {
-            "caller": caller,
-            "call_sid": call_sid,
-            "received_at_unix": received_at_unix,
-        },
-    )
     account_sid = str(form_data.get("AccountSid") or "")
     to_number = str(form_data.get("To") or "")
 
@@ -897,6 +995,18 @@ async def twiml_v7(request: Request) -> Response:
             ),
             media_type="application/xml",
         )
+
+    # Record only genuine inbound calls. The forwarding-loop leg above is an
+    # internal Twilio call and must not replace the user's true last caller.
+    received_at_unix = time.time()
+    base.save_json_file(
+        LAST_RECEIVED_CALL_PATH,
+        {
+            "caller": caller,
+            "call_sid": call_sid,
+            "received_at_unix": received_at_unix,
+        },
+    )
 
     if base.is_trusted_caller(options, caller):
         trusted_name = base.google_synced_name_for_number(caller)
@@ -922,6 +1032,7 @@ async def twiml_v7(request: Request) -> Response:
             "caller": caller,
             "trusted_name": trusted_name,
             "call_sid": call_sid,
+            "received_at_unix": received_at_unix,
             "status": "re_ringing" if rering_enabled and destination else "voicemail",
             "duration_seconds": 0,
             "summary": (

@@ -520,3 +520,17 @@ webhook. Home Assistant publishes this as
 dashboard shows the call in the Home Assistant local time zone.
 
 The Last Call section now includes **Call Received**.
+
+
+## True last-caller dashboard fix in 0.9.2
+
+The dashboard now keys the Last Call panel to the most recent genuine inbound
+Twilio CallSid instead of simply comparing the last completed safe call with the
+last completed AI call.
+
+This fixes cases where an older trusted contact could remain shown as the "last
+caller" after a newer caller was blocked, stayed silent, disconnected before
+GPT-Live started, or otherwise did not create a completed AI-call record.
+
+Internal trusted-caller re-ring loop legs are also excluded from the
+last-received record so they cannot replace the real inbound caller.

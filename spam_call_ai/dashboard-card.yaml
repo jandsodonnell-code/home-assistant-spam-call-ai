@@ -94,14 +94,30 @@ cards:
       type: markdown
       title: Last Call Summary
       content: |
-        {% set summary = states('sensor.spam_call_ai_last_summary') %}
-        {% if summary not in ['unknown', 'unavailable', 'No calls yet'] %}
-        {{ summary }}
-        {% else %}
-        No completed call information yet.
+        {% set caller = state_attr('sensor.spam_call_ai_last_call', 'caller_name') or states('sensor.spam_call_ai_last_caller_name') %}
+        {% set number = state_attr('sensor.spam_call_ai_last_call', 'caller') or states('sensor.spam_call_ai_last_caller') %}
+        {% set summary = state_attr('sensor.spam_call_ai_last_call', 'summary') %}
+        {% if not summary %}
+          {% set summary = state_attr('sensor.spam_call_ai_last_summary', 'full_summary') %}
+        {% endif %}
+        {% if not summary %}
+          {% set summary = states('sensor.spam_call_ai_last_summary') %}
+        {% endif %}
+        {% set callback = state_attr('sensor.spam_call_ai_last_call', 'callback_number') or states('sensor.spam_call_ai_last_callback_number') %}
+
+        {% if caller not in ['', 'unknown', 'unavailable', 'No calls yet'] %}
+        **Caller:** {{ caller }}
+        {% endif %}
+        {% if number not in ['', 'unknown', 'unavailable', 'No calls yet'] %}
+        **Number:** {{ number }}
         {% endif %}
 
-        {% set callback = states('sensor.spam_call_ai_last_callback_number') %}
+        {% if summary and summary not in ['unknown', 'unavailable', 'No calls yet'] %}
+        **Summary:** {{ summary }}
+        {% else %}
+        **Summary:** No completed call information yet.
+        {% endif %}
+
         {% if callback not in ['', 'unknown', 'unavailable', 'None'] %}
         **Callback:** {{ callback }}
         {% endif %}
@@ -142,14 +158,6 @@ cards:
               name: Sync Status
             - entity: sensor.spam_call_ai_google_last_sync
               name: Last Sync
-        - type: button
-          name: Sync Google Contacts
-          icon: mdi:sync
-          tap_action:
-            action: perform-action
-            perform_action: rest_command.spam_call_ai_google_sync
-          hold_action:
-            action: none
         - type: conditional
           conditions:
             - condition: state

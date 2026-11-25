@@ -17,6 +17,7 @@ app = base.app
 SAFE_MESSAGE_PATH = Path("/data/last_safe_message.json")
 SAFE_CALL_PATH = Path("/data/last_safe_call.json")
 LAST_RECEIVED_CALL_PATH = Path("/data/last_received_call.json")
+SAFE_RERING_LOOP_PATH = Path("/data/safe_rering_loop.json")
 SCREEN_PROMPT_DIR = Path("/data/spam_call_ai_prompts")
 SCREEN_PROMPT_DIR.mkdir(parents=True, exist_ok=True)
 
@@ -836,12 +837,15 @@ async def _start_dashboard_entities() -> None:
 def _safe_voicemail_twiml(options: dict) -> str:
     max_seconds = int(options.get("safe_voicemail_max_seconds", 120))
     action_url = base.public_base_url(options) + "/trusted/voicemail"
+    status_url = base.public_base_url(options) + "/trusted/voicemail-status"
     return (
         "<Say>Sorry, I couldn't reach them. Please leave a message after the tone, "
         "then hang up when you're finished.</Say>"
         f'<Record action={quoteattr(action_url)} method="POST" '
+        f'recordingStatusCallback={quoteattr(status_url)} '
+        f'recordingStatusCallbackMethod="POST" '
+        f'recordingStatusCallbackEvent="completed absent" '
         f'maxLength="{max_seconds}" playBeep="true" />'
-        "<Hangup/>"
     )
 
 
@@ -875,9 +879,32 @@ async def trusted_dial_result(request: Request) -> Response:
         }
     )
 
-    # A normal answered conversation should simply end. Very short "completed"
-    # legs are treated like an unanswered forwarding loop and go to voicemail.
-    if status == "completed" and duration > 3:
+    loop_state = base.load_json_file(SAFE_RERING_LOOP_PATH)
+    try:
+        loop_age = time.time() - float(loop_state.get("detected_at_unix") or 0)
+    except (TypeError, ValueError):
+        loop_age = 9999
+    loop_detected = 0 <= loop_age <= 45
+
+    # When the second ring is conditionally forwarded back to the Twilio number,
+    # Twilio can report the <Dial> leg as "completed" even though the user never
+    # answered. The /twiml loop guard writes a short-lived marker so this callback
+    # can correctly continue to voicemail instead of discarding the message.
+    if loop_detected:
+        LOGGER.info(
+            "Safe caller re-ring loop detected; forcing voicemail: caller=%s status=%s duration=%s",
+            caller,
+            status,
+            duration,
+        )
+        try:
+            SAFE_RERING_LOOP_PATH.unlink(missing_ok=True)
+        except Exception:
+            pass
+
+    # A genuinely answered conversation should simply end. Any detected
+    # conditional-forwarding loop must go to voicemail.
+    if status == "completed" and duration > 3 and not loop_detected:
         safe_state["status"] = "answered"
         safe_state["summary"] = "Safe caller connected to your phone. AI was not used."
         base.save_json_file(SAFE_CALL_PATH, safe_state)
@@ -964,6 +991,69 @@ async def trusted_voicemail(request: Request) -> Response:
     return Response(content=xml, media_type="application/xml")
 
 
+@app.post("/trusted/voicemail-status")
+async def trusted_voicemail_status(request: Request) -> Response:
+    options = base.load_options()
+    form = await request.form()
+    form_data = dict(form)
+
+    if not base.validate_twilio_http_request(request, form_data, options):
+        raise HTTPException(status_code=403, detail="Invalid Twilio signature")
+
+    status = str(form_data.get("RecordingStatus") or "").lower()
+    caller = str(form_data.get("From") or "unknown")
+    data = {
+        "caller": caller,
+        "trusted_name": base.google_synced_name_for_number(caller),
+        "call_sid": str(form_data.get("CallSid") or ""),
+        "recording_sid": str(form_data.get("RecordingSid") or ""),
+        "recording_url": str(form_data.get("RecordingUrl") or ""),
+        "recording_duration_seconds": str(form_data.get("RecordingDuration") or ""),
+        "recording_status": status,
+        "recorded_at_unix": time.time(),
+        "safe_caller": True,
+        "ai_used": False,
+    }
+
+    if status == "completed":
+        base.save_json_file(SAFE_MESSAGE_PATH, data)
+        safe_state = base.load_json_file(SAFE_CALL_PATH)
+        safe_state.update(
+            {
+                "caller": caller,
+                "trusted_name": data["trusted_name"]
+                or str(safe_state.get("trusted_name") or ""),
+                "call_sid": data["call_sid"],
+                "status": "voicemail_recorded",
+                "duration_seconds": data["recording_duration_seconds"] or 0,
+                "summary": "Safe caller left a voicemail. AI was not used.",
+                "recording_sid": data["recording_sid"],
+                "recording_url": data["recording_url"],
+                "updated_at_unix": time.time(),
+                "ai_used": False,
+            }
+        )
+        base.save_json_file(SAFE_CALL_PATH, safe_state)
+        LOGGER.info(
+            "Safe voicemail recording completed: caller=%s recording_sid=%s duration=%ss",
+            caller,
+            data["recording_sid"],
+            data["recording_duration_seconds"] or "unknown",
+        )
+        await base.fire_home_assistant_event(
+            "spam_call_ai_safe_message_recorded",
+            data,
+        )
+    elif status == "absent":
+        LOGGER.warning(
+            "Safe voicemail recording absent: caller=%s call_sid=%s",
+            caller,
+            data["call_sid"],
+        )
+
+    return Response(content="", media_type="text/plain")
+
+
 @app.post("/twiml")
 async def twiml_v7(request: Request) -> Response:
     options = base.load_options()
@@ -988,10 +1078,17 @@ async def twiml_v7(request: Request) -> Response:
     # Stop a second-ring conditional-forwarding loop.
     if caller_norm and to_norm and caller_norm == to_norm:
         LOGGER.info("Stopped safe-caller re-ring loop for call_sid=%s", call_sid)
+        base.save_json_file(
+            SAFE_RERING_LOOP_PATH,
+            {
+                "call_sid": call_sid,
+                "detected_at_unix": time.time(),
+            },
+        )
         return Response(
             content=(
                 '<?xml version="1.0" encoding="UTF-8"?>'
-                "<Response><Hangup/></Response>"
+                '<Response><Reject reason="busy"/></Response>'
             ),
             media_type="application/xml",
         )

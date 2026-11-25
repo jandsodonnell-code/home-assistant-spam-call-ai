@@ -534,3 +534,15 @@ GPT-Live started, or otherwise did not create a completed AI-call record.
 
 Internal trusted-caller re-ring loop legs are also excluded from the
 last-received record so they cannot replace the real inbound caller.
+
+
+## Safe voicemail reliability fix in 0.9.3
+
+Trusted callers still bypass AI. If the optional second ring is conditionally
+forwarded back to the Twilio number, the app now records that loop and forces
+the original trusted call into the safe voicemail recorder instead of treating
+the forwarding loop as an answered call.
+
+The safe voicemail recorder also uses Twilio's recordingStatusCallback for
+completed/absent events so the final RecordingSid, RecordingUrl, and duration
+are captured after Twilio finishes processing the recording.
